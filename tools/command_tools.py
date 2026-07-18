@@ -5,10 +5,11 @@ import subprocess
 from pathlib import Path
 from typing import TypedDict
 
+from core.settings import DEFAULT_SETTINGS
 from security.paths import PathSecurityError, WORKSPACE_ROOT, resolve_workspace_path
 
 
-COMMAND_TIMEOUT_SECONDS = 30
+COMMAND_TIMEOUT_SECONDS = DEFAULT_SETTINGS.command_timeout_seconds
 DESTRUCTIVE_COMMANDS = {
     "dd",
     "mkfs",
