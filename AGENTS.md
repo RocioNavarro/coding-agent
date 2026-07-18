@@ -53,7 +53,7 @@ También debe incluir:
 
 ## Calidad
 
-- Usar Python 3.11 o superior.
+- Usar Python 3.10 o superior.
 - Usar type hints.
 - Agregar docstrings relevantes.
 - Separar responsabilidades en módulos.

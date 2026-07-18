@@ -1,6 +1,7 @@
+.env
 .venv/
 __pycache__/
 *.pyc
-.env
+.pytest_cache/
 data/vector_store/
 data/project_memory/
