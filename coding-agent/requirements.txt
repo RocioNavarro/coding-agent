@@ -1,0 +1,1 @@
+# La estructura inicial no requiere dependencias externas.
