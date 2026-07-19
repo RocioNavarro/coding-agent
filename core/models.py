@@ -1,18 +1,10 @@
 """Modelos de datos internos, independientes de cualquier proveedor LLM."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 
-MessageRole = Literal["system", "developer", "user", "assistant"]
-
-
-@dataclass(frozen=True)
-class Message:
-    """Mensaje textual intercambiado con el modelo."""
-
-    role: MessageRole
-    content: str
+MessageRole = Literal["system", "developer", "user", "assistant", "tool"]
 
 
 @dataclass(frozen=True)
@@ -22,6 +14,16 @@ class ToolCall:
     id: str
     name: str
     arguments: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class Message:
+    """Mensaje intercambiado con el modelo, incluidas llamadas y salidas de tools."""
+
+    role: MessageRole
+    content: str
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    tool_call_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -43,3 +45,11 @@ class LLMResponse:
     model: str
     usage: LLMUsage
     latency_ms: float
+
+
+@dataclass(frozen=True)
+class InternalLoopResult:
+    """Respuesta final y cantidad de iteraciones consumidas por el loop interno."""
+
+    response: LLMResponse
+    iterations: int

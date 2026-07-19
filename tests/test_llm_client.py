@@ -77,6 +77,7 @@ def test_multiple_tool_calls_are_normalized_and_schema_is_converted() -> None:
         ToolCall("call-1", "read_file", {"path": "README.md"}),
         ToolCall("call-2", "list_files", {"path": "."}),
     ]
+    assert result.assistant_message.tool_calls == result.tool_calls
     assert sdk.responses.create.call_args.kwargs["tools"] == [{
         "type": "function",
         "name": "read_file",
@@ -156,3 +157,30 @@ def test_invalid_tool_schema_is_rejected_before_sdk_call() -> None:
         )
 
     sdk.responses.create.assert_not_called()
+
+
+def test_tool_history_is_serialized_without_sdk_types() -> None:
+    client, sdk = make_client(make_response())
+    call = ToolCall("call-1", "read_file", {"path": "README.md"})
+    history = [
+        Message(role="user", content="Leé el archivo"),
+        Message(role="assistant", content="", tool_calls=[call]),
+        Message(role="tool", content='{"success": true}', tool_call_id="call-1"),
+    ]
+
+    client.complete(history)
+
+    assert sdk.responses.create.call_args.kwargs["input"] == [
+        {"role": "user", "content": "Leé el archivo"},
+        {
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "read_file",
+            "arguments": '{"path":"README.md"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": '{"success": true}',
+        },
+    ]

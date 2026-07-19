@@ -68,10 +68,7 @@ class OpenAILLMClient:
         """Solicita una respuesta y la convierte al contrato interno."""
         request: dict[str, Any] = {
             "model": self._model,
-            "input": [
-                {"role": message.role, "content": message.content}
-                for message in messages
-            ],
+            "input": self._messages_to_input(messages),
         }
         if tools:
             request["tools"] = [self._to_responses_tool(tool) for tool in tools]
@@ -84,6 +81,44 @@ class OpenAILLMClient:
         latency_ms = (perf_counter() - started_at) * 1000
 
         return self._parse_response(response, latency_ms)
+
+    @staticmethod
+    def _messages_to_input(messages: Sequence[Message]) -> list[dict[str, Any]]:
+        """Convierte el historial propio a items de entrada de Responses API."""
+        items: list[dict[str, Any]] = []
+        for message in messages:
+            if message.role == "tool":
+                if not message.tool_call_id:
+                    raise LLMConfigurationError(
+                        "Un mensaje de tool debe incluir tool_call_id."
+                    )
+                items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": message.tool_call_id,
+                        "output": message.content,
+                    }
+                )
+                continue
+
+            if message.content:
+                items.append({"role": message.role, "content": message.content})
+            for tool_call in message.tool_calls:
+                if message.role != "assistant":
+                    raise LLMConfigurationError(
+                        "Sólo un mensaje assistant puede contener tool calls."
+                    )
+                items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": tool_call.id,
+                        "name": tool_call.name,
+                        "arguments": json.dumps(
+                            tool_call.arguments, ensure_ascii=False, separators=(",", ":")
+                        ),
+                    }
+                )
+        return items
 
     @staticmethod
     def _to_responses_tool(tool: dict[str, Any]) -> dict[str, Any]:
@@ -140,7 +175,9 @@ class OpenAILLMClient:
                 output_tokens=response.usage.output_tokens,
                 total_tokens=response.usage.total_tokens,
             )
-            assistant_message = Message(role="assistant", content=text)
+            assistant_message = Message(
+                role="assistant", content=text, tool_calls=tool_calls
+            )
             return LLMResponse(
                 assistant_message=assistant_message,
                 text=text,
