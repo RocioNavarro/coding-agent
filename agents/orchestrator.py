@@ -98,12 +98,20 @@ class TextResultPresenter:
             if call.tool_name == "validation_command"
         ) or "- No se ejecutaron checks."
         sources = "\n".join(
-            f"- [{source.origin}] {source.reference}" for source in state.sources
+            f"- [{'inferido' if source.origin == 'inference' else 'utilizado'}:"
+            f"{source.origin}] {source.reference}"
+            for source in state.sources
         ) or "- Sin fuentes adicionales."
+        rag_traces = "\n".join(
+            f"- {observation.removeprefix('RAG trace: ')}"
+            for observation in state.observations
+            if observation.startswith("RAG trace: ")
+        ) or "- Sin recuperación RAG registrada."
         return (
             f"{state.final_result}\n\nResultados:\n{agents}\n\n"
             f"Archivos modificados:\n{files}\n\nValidaciones:\n{checks}\n\n"
-            f"Fuentes:\n{sources}"
+            f"Fuentes:\n{sources}\n\nTrazabilidad RAG (recuperado/utilizado):\n"
+            f"{rag_traces}"
         )
 
 

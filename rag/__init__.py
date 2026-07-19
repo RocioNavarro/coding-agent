@@ -11,6 +11,12 @@ from rag.processing import (
     TextNormalizer,
     WhitespaceNormalizer,
 )
+from rag.retriever import (
+    RagRetrievalTrace,
+    RagRetriever,
+    RetrievalSufficiency,
+    RetrievedChunk,
+)
 from rag.sources import ConfiguredSourceLoader, SourceLoader, SourceManifest
 from rag.vector_store import JsonVectorStore, VectorStore
 
@@ -27,6 +33,10 @@ __all__ = [
     "IndexingResult",
     "JsonVectorStore",
     "RawDocument",
+    "RagRetrievalTrace",
+    "RagRetriever",
+    "RetrievalSufficiency",
+    "RetrievedChunk",
     "SectionDocumentParser",
     "SourceConfig",
     "SourceLoader",

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Literal, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 from agents.base import AgentContext, AgentExecutionError, AgentInput, BaseAgent
 from core.llm_client import LLMClient
@@ -103,6 +103,20 @@ class KnowledgeRetriever(ABC):
     def retrieve(self, query: str, *, limit: int = 5) -> Sequence[EvidenceFragment]:
         """Recupera fragmentos desde el índice RAG configurado."""
 
+    def retrieve_filtered(
+        self,
+        query: str,
+        *,
+        filters: Mapping[str, str | Sequence[str]] | None = None,
+        limit: int = 5,
+    ) -> Sequence[EvidenceFragment]:
+        """Compatibilidad para proveedores sin soporte de filtros dinámicos."""
+        return self.retrieve(query, limit=limit)
+
+    def retrieval_audit(self) -> Mapping[str, Any] | None:
+        """Devuelve la última traza cuando el proveedor la soporta."""
+        return None
+
 
 class WebSearchProvider(ABC):
     @abstractmethod
@@ -190,6 +204,7 @@ class ResearcherAgent(BaseAgent):
         if not isinstance(task_state, TaskState):
             raise TypeError("task_state debe ser una instancia de TaskState.")
         queries: list[ResearchQuery] = []
+        rag_audit: Mapping[str, Any] | None = None
         try:
             query = self.build_research_query(instruction, task_state, context)
 
@@ -200,8 +215,14 @@ class ResearcherAgent(BaseAgent):
 
             queries.append(ResearchQuery("rag", query))
             rag = self._validate_fragments(
-                self.knowledge_retriever.retrieve(query, limit=5), "rag"
+                self.knowledge_retriever.retrieve_filtered(
+                    query,
+                    filters=self._build_rag_filters(task_state, context),
+                    limit=5,
+                ),
+                "rag",
             )
+            rag_audit = self.knowledge_retriever.retrieval_audit()
 
             repository = self._repository_fragments(task_state, context)
             fragments = [*repository, *memory, *rag]
@@ -266,6 +287,11 @@ class ResearcherAgent(BaseAgent):
             f"Researcher usó web: {'sí' if web_used else 'no'}; "
             f"confianza: {final_assessment.confidence:.2f}."
         )
+        if rag_audit:
+            task_state.add_observation(
+                "RAG trace: "
+                + json.dumps(self._compact_rag_audit(rag_audit), ensure_ascii=False)
+            )
         return ResearcherResult(
             queries_performed=tuple(queries),
             sources_recovered=sources,
@@ -314,6 +340,57 @@ class ResearcherAgent(BaseAgent):
         if context is not None and context.facts:
             parts.append("Contexto seleccionado: " + " | ".join(context.facts))
         return "\n".join(parts)
+
+    @staticmethod
+    def _build_rag_filters(
+        state: TaskState, context: AgentContext | None
+    ) -> dict[str, tuple[str, ...]]:
+        filters: dict[str, list[str]] = {}
+        supported = {"technology", "language", "framework", "source_type", "module", "tags"}
+        for finding in state.repository_findings:
+            prefix, separator, remainder = finding.partition("=")
+            key = prefix.strip().casefold()
+            if separator and key in supported:
+                value = remainder.split(";", 1)[0].strip()
+                if value:
+                    filters.setdefault(key, []).append(value)
+        if context is not None:
+            for fact in context.facts:
+                if not fact.startswith("rag_filter:"):
+                    continue
+                expression = fact.removeprefix("rag_filter:")
+                key, separator, value = expression.partition("=")
+                key = key.strip().casefold()
+                if separator and key in supported and value.strip():
+                    filters.setdefault(key, []).append(value.strip())
+        return {key: tuple(dict.fromkeys(values)) for key, values in filters.items()}
+
+    @staticmethod
+    def _compact_rag_audit(audit: Mapping[str, Any]) -> dict[str, Any]:
+        def summarize(items: object) -> list[dict[str, Any]]:
+            if not isinstance(items, list):
+                return []
+            return [
+                {
+                    "chunk_id": item.get("chunk_id"),
+                    "score": item.get("score"),
+                    "document_id": item.get("metadata", {}).get("document_id"),
+                    "path_or_url": item.get("metadata", {}).get("path_or_url"),
+                }
+                for item in items
+                if isinstance(item, dict)
+            ]
+
+        return {
+            "query": audit.get("query"),
+            "filters": audit.get("filters", {}),
+            "retrieved": summarize(audit.get("retrieved_chunks")),
+            "used": summarize(audit.get("used_chunks")),
+            "scores": audit.get("scores", {}),
+            "documents": audit.get("documents", []),
+            "conclusions": audit.get("conclusions", []),
+            "sufficiency": audit.get("sufficiency", {}),
+        }
 
     def _synthesize(
         self,

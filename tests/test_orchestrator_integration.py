@@ -188,7 +188,7 @@ def test_change_runs_full_pipeline_after_approval() -> None:
     )
     assert implementer.calls == tester.calls == reviewer.calls == 1
     assert result.task_state.approved_plan == "Plan 1 para Modificar el comportamiento"
-    assert "[rag] knowledge://evidence" in result.final_response
+    assert "[utilizado:rag] knowledge://evidence" in result.final_response
 
 
 def test_rejected_plan_stops_before_changes() -> None:

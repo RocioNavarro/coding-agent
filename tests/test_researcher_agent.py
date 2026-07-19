@@ -73,6 +73,46 @@ class FakeRAG(KnowledgeRetriever):
         return self.fragments
 
 
+class TracedRAG(FakeRAG):
+    def __init__(self, events: list[str], fragments: Sequence[EvidenceFragment]) -> None:
+        super().__init__(events, fragments)
+        self.filters: dict[str, Sequence[str] | str] = {}
+
+    def retrieve_filtered(self, query: str, *, filters=None, limit: int = 5):
+        self.filters = dict(filters or {})
+        return self.retrieve(query, limit=limit)
+
+    def retrieval_audit(self):
+        return {
+            "query": self.queries[-1],
+            "filters": self.filters,
+            "retrieved_chunks": [
+                {
+                    "chunk_id": "chunk-1",
+                    "score": 0.91,
+                    "metadata": {
+                        "document_id": "doc-1",
+                        "path_or_url": "docs/api.md",
+                    },
+                }
+            ],
+            "used_chunks": [
+                {
+                    "chunk_id": "chunk-1",
+                    "score": 0.91,
+                    "metadata": {
+                        "document_id": "doc-1",
+                        "path_or_url": "docs/api.md",
+                    },
+                }
+            ],
+            "scores": {"chunk-1": 0.91},
+            "documents": ["doc-1"],
+            "conclusions": ["Evidencia suficiente."],
+            "sufficiency": {"sufficient": True, "confidence": 0.91, "reasons": []},
+        }
+
+
 class FakeWeb(WebSearchProvider):
     def __init__(self, events: list[str], fragments: Sequence[EvidenceFragment]) -> None:
         self.events = events
@@ -227,6 +267,29 @@ def test_query_adapts_to_explorer_technologies_files_errors_and_configuration() 
     sent_context = json.loads(llm.messages[1].content)["context"]
     assert any("project_memory" in fact for fact in sent_context["facts"])
     assert llm.tools == []
+
+
+def test_passes_explorer_filters_and_registers_rag_trace_in_task_state() -> None:
+    events: list[str] = []
+    memory = FakeMemory(events, [fragment("project_memory", "decision", "Memory")])
+    rag = TracedRAG(events, [fragment("rag", "rag://doc-1/0", "RAG evidence")])
+    state = populated_state()
+    researcher = ResearcherAgent(
+        llm_client=FakeLLM(),
+        project_memory=memory,
+        knowledge_retriever=rag,
+        sufficiency_evaluator=ScriptedEvaluator(events, True),
+    )
+
+    researcher.run("Investigar", state)
+
+    assert rag.filters == {"language": ("Python",), "framework": ("FastAPI",)}
+    trace = next(item for item in state.observations if item.startswith("RAG trace: "))
+    payload = json.loads(trace.removeprefix("RAG trace: "))
+    assert payload["retrieved"][0]["chunk_id"] == "chunk-1"
+    assert payload["used"][0]["score"] == 0.91
+    assert payload["documents"] == ["doc-1"]
+    assert payload["conclusions"] == ["Evidencia suficiente."]
 
 
 def test_reports_missing_information_when_web_is_needed_but_unavailable() -> None:
