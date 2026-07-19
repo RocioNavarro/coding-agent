@@ -125,3 +125,97 @@ def test_trace_records_query_url_title_fragment_found_and_used() -> None:
     }
     assert audit["used"] == audit["found"]
     assert audit["conclusions"]
+
+
+def test_config_from_dict_normalizes_all_dynamic_options() -> None:
+    config = WebSearchConfig.from_dict(
+        {
+            "allowed_domains": ["WWW.Allowed.Test", "allowed.test"],
+            "priority_domains": "https://priority.test/docs",
+            "blocked_domains": ["blocked.test"],
+            "max_results": 3,
+            "technology_domains": {
+                "Runtime-X": ["WWW.RUNTIME.TEST", "runtime.test"],
+            },
+        }
+    )
+
+    assert config.allowed_domains == ("allowed.test",)
+    assert config.priority_domains == ("priority.test",)
+    assert config.blocked_domains == ("blocked.test",)
+    assert config.max_results == 3
+    assert config.technology_domains == {"runtime-x": ("runtime.test",)}
+
+
+def test_does_not_repeat_identical_priority_and_general_queries() -> None:
+    backend = FakeBackend([])
+    provider = ConfiguredWebSearchProvider(
+        WebSearchConfig(
+            allowed_domains=("docs.test",),
+            priority_domains=("docs.test",),
+        ),
+        backend=backend,
+    )
+
+    provider.search("query")
+
+    assert backend.calls == [("query (site:docs.test)", 5)]
+
+
+def test_blocked_domains_override_allowed_and_priority_domains() -> None:
+    backend = FakeBackend(
+        [
+            result("Allowed priority", "https://priority.test/guide"),
+            result("Blocked priority", "https://blocked.priority.test/guide"),
+        ]
+    )
+    provider = ConfiguredWebSearchProvider(
+        WebSearchConfig(
+            allowed_domains=("priority.test",),
+            priority_domains=("priority.test", "blocked.priority.test"),
+            blocked_domains=("blocked.priority.test",),
+            max_results=2,
+        ),
+        backend=backend,
+    )
+
+    evidence = provider.search("query")
+
+    assert "site:priority.test" in backend.calls[0][0]
+    assert "site:blocked.priority.test" not in backend.calls[0][0]
+    assert [item.reference for item in evidence] == ["https://priority.test/guide"]
+
+
+def test_global_result_limit_applies_when_multiple_queries_are_combined() -> None:
+    class SequencedBackend:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, int]] = []
+
+        def __call__(self, query: str, max_results: int):
+            self.calls.append((query, max_results))
+            if len(self.calls) == 1:
+                return [result("Priority", "https://priority.test/one")]
+            return [
+                result("General one", "https://allowed.test/two"),
+                result("General two", "https://allowed.test/three"),
+                result("General three", "https://allowed.test/four"),
+            ]
+
+    backend = SequencedBackend()
+    provider = ConfiguredWebSearchProvider(
+        WebSearchConfig(
+            allowed_domains=("priority.test", "allowed.test"),
+            priority_domains=("priority.test",),
+            max_results=3,
+        ),
+        backend=backend,
+    )
+
+    evidence = provider.search("query", limit=3)
+    audit = provider.search_audit()
+
+    assert len(backend.calls) == 2
+    assert len(evidence) == 3
+    assert audit is not None
+    assert len(audit["found"]) == 3
+    assert len(audit["used"]) == 3

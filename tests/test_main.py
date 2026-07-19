@@ -350,6 +350,24 @@ def test_load_environment_reads_temporary_dotenv(
     assert os.environ["TAVILY_API_KEY"] == "test-tavily-key"
 
 
+def test_settings_load_web_search_options_from_existing_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODING_AGENT_WEB_SEARCH_ENABLED", "true")
+    monkeypatch.setenv(
+        "CODING_AGENT_WEB_SEARCH_CONFIG",
+        '{"allowed_domains":["docs.test"],"max_results":2}',
+    )
+
+    settings = AgentSettings.from_environment()
+
+    assert settings.web_search_enabled is True
+    assert settings.web_search_config == {
+        "allowed_domains": ["docs.test"],
+        "max_results": 2,
+    }
+
+
 def test_main_loads_environment_before_constructing_client() -> None:
     calls: list[str] = []
 

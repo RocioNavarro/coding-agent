@@ -225,7 +225,7 @@ def main() -> None:
     """Construye las dependencias concretas e inicia el chat."""
     try:
         load_environment()
-        settings = AgentSettings()
+        settings = AgentSettings.from_environment()
         client = OpenAILLMClient()
         registry = build_default_registry()
         run_chat(client, registry, settings)

@@ -1,6 +1,9 @@
 """Configuración central del coding agent."""
 
+import json
+import os
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass
@@ -11,6 +14,26 @@ class AgentSettings:
     plan_mode_enabled: bool = True
     max_iterations: int = 20
     command_timeout_seconds: int = 60
+    web_search_enabled: bool = True
+    web_search_config: dict[str, Any] | None = None
+
+    @classmethod
+    def from_environment(cls) -> "AgentSettings":
+        """Carga opciones no secretas desde el entorno ya inicializado."""
+        enabled = os.getenv("CODING_AGENT_WEB_SEARCH_ENABLED", "true").strip().casefold()
+        if enabled not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
+            raise ValueError("CODING_AGENT_WEB_SEARCH_ENABLED debe ser booleano.")
+        raw_config = os.getenv("CODING_AGENT_WEB_SEARCH_CONFIG", "{}").strip() or "{}"
+        try:
+            config = json.loads(raw_config)
+        except json.JSONDecodeError as error:
+            raise ValueError("CODING_AGENT_WEB_SEARCH_CONFIG debe contener JSON válido.") from error
+        if not isinstance(config, dict):
+            raise ValueError("CODING_AGENT_WEB_SEARCH_CONFIG debe ser un objeto JSON.")
+        return cls(
+            web_search_enabled=enabled in {"true", "1", "yes", "on"},
+            web_search_config=config,
+        )
 
 
 DEFAULT_SETTINGS = AgentSettings()

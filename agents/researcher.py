@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Sequence
 
 from agents.base import AgentContext, AgentExecutionError, AgentInput, BaseAgent
 from core.llm_client import LLMClient
+from core.settings import AgentSettings
 from core.task_state import ErrorRecord, SourceOrigin, SourceReference, SubagentResult, TaskState
 from tools.registry import ToolRegistry
 
@@ -202,6 +204,34 @@ class ResearcherAgent(BaseAgent):
             sufficiency_evaluator or ThresholdSufficiencyEvaluator()
         )
 
+    @classmethod
+    def from_settings(
+        cls,
+        *,
+        llm_client: LLMClient,
+        project_memory: ProjectMemoryProvider,
+        knowledge_retriever: KnowledgeRetriever,
+        settings: AgentSettings,
+        sufficiency_evaluator: EvidenceSufficiencyEvaluator | None = None,
+        name: str = "researcher",
+    ) -> "ResearcherAgent":
+        """Compone Researcher con el fallback web habilitado por configuración."""
+        provider: WebSearchProvider | None = None
+        if settings.web_search_enabled and os.getenv("TAVILY_API_KEY"):
+            from agents.web_research import ConfiguredWebSearchProvider, WebSearchConfig
+
+            provider = ConfiguredWebSearchProvider(
+                WebSearchConfig.from_dict(settings.web_search_config or {})
+            )
+        return cls(
+            llm_client=llm_client,
+            project_memory=project_memory,
+            knowledge_retriever=knowledge_retriever,
+            web_search=provider,
+            sufficiency_evaluator=sufficiency_evaluator,
+            name=name,
+        )
+
     def specialization_prompt(self) -> str:
         return (
             "La entrada contiene consultas y fragmentos ya recuperados. Devolvé un "
@@ -266,6 +296,19 @@ class ResearcherAgent(BaseAgent):
             missing = final_assessment.missing_information
             if web_needed and self.web_search is None:
                 missing = (*missing, "La búsqueda web no está configurada.")
+                task_state.add_observation(
+                    "WEB trace: "
+                    + json.dumps(
+                        {
+                            "query": query,
+                            "executed_queries": [],
+                            "found": [],
+                            "used": [],
+                            "conclusions": ["La búsqueda web no está disponible."],
+                        },
+                        ensure_ascii=False,
+                    )
+                )
 
             subagent_result = self._synthesize(
                 instruction,

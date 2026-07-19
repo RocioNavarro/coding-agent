@@ -4,6 +4,8 @@ import json
 from collections.abc import Sequence
 from typing import Any
 
+import pytest
+
 from agents.researcher import (
     EvidenceFragment,
     EvidenceSufficiencyEvaluator,
@@ -13,7 +15,9 @@ from agents.researcher import (
     SufficiencyAssessment,
     WebSearchProvider,
 )
+from agents.web_research import ConfiguredWebSearchProvider
 from core.models import LLMResponse, LLMUsage, Message
+from core.settings import AgentSettings
 from core.task_state import ErrorRecord, SourceReference, SubagentResult, TaskState
 
 
@@ -375,11 +379,68 @@ def test_reports_missing_information_when_web_is_needed_but_unavailable() -> Non
         sufficiency_evaluator=ScriptedEvaluator(events, False),
     )
 
-    result = researcher.run("Investigar un dato ausente", populated_state())
+    state = populated_state()
+    result = researcher.run("Investigar un dato ausente", state)
 
     assert events == ["memory", "rag", "evaluate"]
+    trace = next(item for item in state.observations if item.startswith("WEB trace: "))
+    assert json.loads(trace.removeprefix("WEB trace: "))["conclusions"] == [
+        "La búsqueda web no está disponible."
+    ]
     assert result.web_needed is True
     assert result.web_used is False
     assert "Falta documentación externa." in result.missing_information
     assert "La búsqueda web no está configurada." in result.missing_information
     assert result.subagent_result.status == "blocked"
+
+
+def test_from_settings_assembles_configured_web_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TAVILY_API_KEY", "configured-for-test")
+    researcher = ResearcherAgent.from_settings(
+        llm_client=FakeLLM(),
+        project_memory=FakeMemory([], []),
+        knowledge_retriever=FakeRAG([], []),
+        settings=AgentSettings(
+            web_search_enabled=True,
+            web_search_config={
+                "allowed_domains": ["allowed.test"],
+                "max_results": 2,
+            },
+        ),
+    )
+
+    assert isinstance(researcher.web_search, ConfiguredWebSearchProvider)
+    assert researcher.web_search.config.allowed_domains == ("allowed.test",)
+    assert researcher.web_search.config.max_results == 2
+
+
+def test_from_settings_keeps_researcher_available_without_web_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    researcher = ResearcherAgent.from_settings(
+        llm_client=FakeLLM(),
+        project_memory=FakeMemory([], []),
+        knowledge_retriever=FakeRAG([], []),
+        settings=AgentSettings(web_search_enabled=True),
+    )
+
+    assert researcher.web_search is None
+
+
+def test_from_settings_respects_disabled_web_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TAVILY_API_KEY", "configured-but-disabled")
+
+    researcher = ResearcherAgent.from_settings(
+        llm_client=FakeLLM(),
+        project_memory=FakeMemory([], []),
+        knowledge_retriever=FakeRAG([], []),
+        settings=AgentSettings(web_search_enabled=False),
+    )
+
+    assert researcher.web_search is None
