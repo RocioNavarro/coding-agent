@@ -1,0 +1,43 @@
+# Copiar como agent.config.yaml y adaptar sólo lo necesario.
+workspace:
+  path: workspace
+  ignore:
+    - .git/**
+    - .cache/**
+
+permissions:
+  read: true
+  write: false
+  run_commands: false
+  web_search: false
+
+commands: {}
+
+limits:
+  max_iterations: 20
+  context_chars: 8000
+  command_timeout_seconds: 60
+  max_rag_results: 5
+  max_web_results: 5
+
+rag:
+  enabled: false
+  index_path: .coding-agent/rag/index.json
+  sources: []
+
+memory:
+  enabled: true
+  path: .coding-agent/memory
+
+observability:
+  enabled: true
+  log_level: INFO
+  trace_tools: true
+
+web_search:
+  enabled: false
+  allowed_domains: []
+  priority_domains: []
+  blocked_domains: []
+  max_results: 5
+  technology_domains: {}
