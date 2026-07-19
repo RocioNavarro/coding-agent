@@ -11,6 +11,7 @@ from tools.definitions import (
     ToolValidationError,
 )
 from tools.file_tools import list_files, read_file, write_file
+from tools.web_tools import web_search
 
 
 JSON_TYPES: dict[str, type[Any] | tuple[type[Any], ...]] = {
@@ -192,6 +193,28 @@ def build_default_registry() -> ToolRegistry:
             ),
             executor=run_command,
             modifies_system=True,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="web_search",
+            description="Busca información actual en la web mediante Tavily.",
+            parameters=_parameters(
+                {
+                    "query": {
+                        "type": "string",
+                        "description": "Consulta concreta que se buscará.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Cantidad de resultados, entre 1 y 10.",
+                        "default": 5,
+                    },
+                },
+                required=["query"],
+            ),
+            executor=web_search,
+            modifies_system=False,
         )
     )
     return registry

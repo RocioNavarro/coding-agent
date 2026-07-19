@@ -50,8 +50,8 @@ def test_default_registry_contains_only_expected_tools() -> None:
         "write_file",
         "list_files",
         "run_command",
+        "web_search",
     }
-    assert registry.get("web_search") is None
 
 
 def test_default_tools_mark_system_modification() -> None:
@@ -59,6 +59,7 @@ def test_default_tools_mark_system_modification() -> None:
     assert TOOL_REGISTRY.get("list_files").modifies_system is False  # type: ignore[union-attr]
     assert TOOL_REGISTRY.get("write_file").modifies_system is True  # type: ignore[union-attr]
     assert TOOL_REGISTRY.get("run_command").modifies_system is True  # type: ignore[union-attr]
+    assert TOOL_REGISTRY.get("web_search").modifies_system is False  # type: ignore[union-attr]
 
 
 def test_schema_does_not_expose_executor_or_metadata() -> None:

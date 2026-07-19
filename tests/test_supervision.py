@@ -8,7 +8,7 @@ from core.settings import AgentSettings
 from core.supervision import SupervisedToolExecutor
 from tools.command_tools import COMMAND_TIMEOUT_SECONDS
 from tools.definitions import ToolDefinition
-from tools.registry import ToolRegistry
+from tools.registry import TOOL_REGISTRY, ToolRegistry
 
 
 EMPTY_PARAMETERS = {
@@ -185,3 +185,11 @@ def test_unknown_tool_returns_controlled_result() -> None:
 
     assert result["success"] is False
     assert result["error"] == "La tool 'missing' no está registrada."
+
+
+def test_web_search_does_not_require_supervision_approval() -> None:
+    tool = TOOL_REGISTRY.get("web_search")
+    assert tool is not None
+    executor = SupervisedToolExecutor(TOOL_REGISTRY, AgentSettings())
+
+    assert executor.requires_confirmation(tool) is False
