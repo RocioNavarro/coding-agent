@@ -1,5 +1,6 @@
 """Tests del loop interno con un LLM falso y tools sin efectos externos."""
 
+import json
 from collections.abc import Sequence
 from typing import Any
 
@@ -7,6 +8,7 @@ import pytest
 
 from core.harness import MaxIterationsError, run_internal_loop
 from core.models import LLMResponse, LLMUsage, Message, ToolCall
+from core.progress import ProgressLimits, ProgressMonitor
 from core.settings import AgentSettings
 from tools.definitions import ToolDefinition
 from tools.registry import ToolRegistry
@@ -196,6 +198,33 @@ def test_max_iterations_raises_and_preserves_history() -> None:
 
     assert len(history) == 5
     assert history[-1].role == "tool"
+
+
+def test_progress_monitor_reports_repeated_command_error_to_history() -> None:
+    call = ToolCall("call-run", "run_command", {"command": "python hello.py"})
+    fake_llm = FakeLLMClient(
+        [
+            llm_response(tool_calls=[call]),
+            llm_response(tool_calls=[call]),
+            llm_response("Cambio de estrategia"),
+        ]
+    )
+    history = [Message(role="user", content="Validar")]
+    output: list[str] = []
+
+    run_internal_loop(
+        fake_llm,
+        make_registry([], command_error=True),
+        AgentSettings(max_iterations=4),
+        history,
+        lambda tool, arguments: True,
+        output.append,
+        ProgressMonitor(ProgressLimits(command_error_repeats=2)),
+    )
+
+    tool_payloads = [json.loads(message.content) for message in history if message.role == "tool"]
+    assert tool_payloads[-1]["progress"]["recommendation"] == "retry_with_new_strategy"
+    assert any("ProgressMonitor: retry_with_new_strategy" in line for line in output)
 
 
 def test_executor_error_is_returned_to_llm() -> None:

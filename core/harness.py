@@ -9,6 +9,7 @@ from typing import Any
 
 from core.llm_client import LLMClient
 from core.models import InternalLoopResult, Message, PlanningResult, PlanReview
+from core.progress import ProgressAssessment, ProgressMonitor
 from core.settings import AgentSettings
 from core.supervision import ConfirmationCallback, SupervisedToolExecutor
 from tools.registry import ToolRegistry
@@ -96,9 +97,11 @@ def run_internal_loop(
     history: list[Message],
     confirm: ConfirmationCallback | None = None,
     output: OutputCallback = print,
+    progress_monitor: ProgressMonitor | None = None,
 ) -> InternalLoopResult:
     """Ejecuta tool calling hasta obtener texto final o agotar el límite."""
     executor = SupervisedToolExecutor(tool_registry, settings, confirm)
+    progress = progress_monitor or ProgressMonitor()
 
     for iteration in range(1, settings.max_iterations + 1):
         output(_format_iteration_heading(iteration))
@@ -108,21 +111,64 @@ def run_internal_loop(
         if not response.tool_calls:
             return InternalLoopResult(response=response, iterations=iteration)
 
+        iteration_evidence: list[str] = []
         for tool_call in response.tool_calls:
             output(_describe_tool(tool_call.name, tool_call.arguments))
             output(f"Tool: {tool_call.name}")
             output(f"Argumentos:\n{_format_arguments(tool_call.arguments)}")
             execution = executor.execute(tool_call.name, tool_call.arguments)
-            output(f"Resultado:\n{_format_result(execution)}")
+            assessment = progress.record_tool_call(
+                "main",
+                tool_call.name,
+                tool_call.arguments,
+                execution,
+                justification=(
+                    str(tool_call.arguments["justification"])
+                    if "justification" in tool_call.arguments
+                    else None
+                ),
+            )
+            execution_payload: dict[str, Any] = dict(execution)
+            if assessment.detected:
+                execution_payload["progress"] = assessment.to_dict()
+                _report_progress(assessment, output)
+            if execution.get("success"):
+                iteration_evidence.append(
+                    json.dumps(execution.get("result"), ensure_ascii=False, default=str)
+                )
+            output(f"Resultado:\n{_format_result(execution_payload)}")
             history.append(
                 Message(
                     role="tool",
-                    content=json.dumps(execution, ensure_ascii=False, default=str),
+                    content=json.dumps(execution_payload, ensure_ascii=False, default=str),
                     tool_call_id=tool_call.id,
                 )
             )
 
+        iteration_assessment = progress.record_iteration(evidence=iteration_evidence)
+        if iteration_assessment.detected:
+            _report_progress(iteration_assessment, output)
+            history.append(
+                Message(
+                    role="developer",
+                    content=(
+                        "ProgressMonitor recomienda "
+                        f"{iteration_assessment.recommendation}: "
+                        f"{iteration_assessment.reason}"
+                    ),
+                )
+            )
+
     raise MaxIterationsError(settings.max_iterations)
+
+
+def _report_progress(
+    assessment: ProgressAssessment, output: OutputCallback
+) -> None:
+    output(
+        "ProgressMonitor: "
+        f"{assessment.recommendation} — {assessment.reason}"
+    )
 
 
 def _format_iteration_heading(iteration: int) -> str:
