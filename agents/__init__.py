@@ -31,6 +31,18 @@ from agents.researcher import (
     ResearcherResult,
     WebSearchProvider,
 )
+from agents.tester import (
+    StaticCommandProvider,
+    SubprocessValidationExecutor,
+    TaskStateCommandProvider,
+    TesterAgent,
+    TesterLimits,
+    TesterResult,
+    ValidationCommand,
+    ValidationCommandProvider,
+    ValidationExecutor,
+    ValidationSafetyPolicy,
+)
 
 __all__ = [
     "AgentContext",
@@ -54,8 +66,18 @@ __all__ = [
     "ResearcherResult",
     "StubAgent",
     "StateContextManager",
+    "StaticCommandProvider",
+    "SubprocessValidationExecutor",
+    "TaskStateCommandProvider",
     "ScopedWritePolicy",
     "TechnologyDetector",
+    "TesterAgent",
+    "TesterLimits",
+    "TesterResult",
+    "ValidationCommand",
+    "ValidationCommandProvider",
+    "ValidationExecutor",
+    "ValidationSafetyPolicy",
     "WebSearchProvider",
     "WritePolicy",
     "build_explorer_registry",
