@@ -3,6 +3,8 @@
 from typing import Any, Callable
 
 from core.settings import AgentSettings
+from security.paths import WORKSPACE_ROOT
+from security.policy_engine import PolicyContext, PolicyEngine
 from tools.definitions import ToolDefinition, ToolExecutionResult, ToolValidationError
 from tools.registry import ToolRegistry
 
@@ -18,10 +20,21 @@ class SupervisedToolExecutor:
         registry: ToolRegistry,
         settings: AgentSettings,
         confirm: ConfirmationCallback | None = None,
+        *,
+        policy_engine: PolicyEngine | None = None,
+        policy_context: PolicyContext | None = None,
     ) -> None:
         self._registry = registry
         self._settings = settings
         self._confirm = confirm
+        self._policy_engine = policy_engine or PolicyEngine()
+        configured = settings.agent_config
+        self._policy_context = policy_context or PolicyContext(
+            agent="main",
+            workspace=configured.workspace.path if configured else WORKSPACE_ROOT,
+            config=configured,
+            settings=settings,
+        )
 
     def requires_confirmation(self, tool: ToolDefinition) -> bool:
         """Indica si una tool debe aprobarse antes de su ejecución."""
@@ -38,7 +51,16 @@ class SupervisedToolExecutor:
         except ToolValidationError as error:
             return {"success": False, "result": None, "error": str(error)}
 
-        if self.requires_confirmation(tool):
+        decision = self._policy_engine.evaluate(
+            name,
+            validated,
+            self._policy_context,
+            modifies_system=tool.modifies_system,
+        )
+        if decision.outcome == "deny":
+            return {"success": False, "result": None, "error": decision.reason}
+
+        if decision.outcome == "require_approval":
             approval_error = self._request_approval(tool, validated)
             if approval_error is not None:
                 return {"success": False, "result": None, "error": approval_error}
