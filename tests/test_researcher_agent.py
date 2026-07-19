@@ -92,7 +92,9 @@ class TracedRAG(FakeRAG):
                     "score": 0.91,
                     "metadata": {
                         "document_id": "doc-1",
-                        "path_or_url": "docs/api.md",
+                        "path_or_url": "https://official.test/api",
+                        "source_type": "official_documentation",
+                        "tags": ["official"],
                     },
                 }
             ],
@@ -102,7 +104,9 @@ class TracedRAG(FakeRAG):
                     "score": 0.91,
                     "metadata": {
                         "document_id": "doc-1",
-                        "path_or_url": "docs/api.md",
+                        "path_or_url": "https://official.test/api",
+                        "source_type": "official_documentation",
+                        "tags": ["official"],
                     },
                 }
             ],
@@ -123,6 +127,46 @@ class FakeWeb(WebSearchProvider):
         self.events.append("web")
         self.queries.append(query)
         return self.fragments
+
+
+class ContextualWeb(FakeWeb):
+    def __init__(self, events: list[str], fragments: Sequence[EvidenceFragment]) -> None:
+        super().__init__(events, fragments)
+        self.technologies: tuple[str, ...] = ()
+        self.rag_metadata: tuple[dict[str, Any], ...] = ()
+
+    def search_context(
+        self, query: str, *, limit: int = 5, technologies=(), rag_metadata=()
+    ):
+        self.technologies = tuple(technologies)
+        self.rag_metadata = tuple(dict(item) for item in rag_metadata)
+        return self.search(query, limit=limit)
+
+    def search_audit(self):
+        fragment = self.fragments[0]
+        return {
+            "query": self.queries[-1],
+            "executed_queries": [self.queries[-1]],
+            "found": [
+                {
+                    "url": fragment.reference,
+                    "title": "Official result",
+                    "snippet": fragment.content,
+                    "domain": "official.test",
+                    "priority": True,
+                }
+            ],
+            "used": [
+                {
+                    "url": fragment.reference,
+                    "title": "Official result",
+                    "snippet": fragment.content,
+                    "domain": "official.test",
+                    "priority": True,
+                }
+            ],
+            "conclusions": ["Se utilizó documentación prioritaria."],
+        }
 
 
 class ScriptedEvaluator(EvidenceSufficiencyEvaluator):
@@ -224,6 +268,33 @@ def test_rag_precedes_web_and_web_is_used_only_as_fallback() -> None:
     assert [query.provider for query in result.queries_performed] == [
         "project_memory", "rag", "web"
     ]
+
+
+def test_web_fallback_receives_detected_technologies_and_official_rag_metadata() -> None:
+    events: list[str] = []
+    memory = FakeMemory(events, [])
+    rag = TracedRAG(events, [])
+    web = ContextualWeb(
+        events,
+        [fragment("web", "https://official.test/reference", "Official fragment")],
+    )
+    state = populated_state()
+    researcher = ResearcherAgent(
+        llm_client=FakeLLM(),
+        project_memory=memory,
+        knowledge_retriever=rag,
+        web_search=web,
+        sufficiency_evaluator=ScriptedEvaluator(events, False),
+    )
+
+    researcher.run("Investigar fallback", state)
+
+    assert web.technologies == ("Python", "FastAPI")
+    assert web.rag_metadata[0]["path_or_url"] == "https://official.test/api"
+    trace = next(item for item in state.observations if item.startswith("WEB trace: "))
+    payload = json.loads(trace.removeprefix("WEB trace: "))
+    assert payload["found"][0]["title"] == "Official result"
+    assert payload["used"][0]["snippet"] == "Official fragment"
 
 
 def test_preserves_source_traceability_in_result_and_shared_state() -> None:

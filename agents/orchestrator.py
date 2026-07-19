@@ -107,11 +107,16 @@ class TextResultPresenter:
             for observation in state.observations
             if observation.startswith("RAG trace: ")
         ) or "- Sin recuperación RAG registrada."
+        web_traces = "\n".join(
+            f"- {observation.removeprefix('WEB trace: ')}"
+            for observation in state.observations
+            if observation.startswith("WEB trace: ")
+        ) or "- Sin fallback web registrado."
         return (
             f"{state.final_result}\n\nResultados:\n{agents}\n\n"
             f"Archivos modificados:\n{files}\n\nValidaciones:\n{checks}\n\n"
             f"Fuentes:\n{sources}\n\nTrazabilidad RAG (recuperado/utilizado):\n"
-            f"{rag_traces}"
+            f"{rag_traces}\n\nTrazabilidad web (encontrado/utilizado):\n{web_traces}"
         )
 
 

@@ -123,6 +123,20 @@ class WebSearchProvider(ABC):
     def search(self, query: str, *, limit: int = 5) -> Sequence[EvidenceFragment]:
         """Busca evidencia externa únicamente cuando memoria y RAG no alcanzan."""
 
+    def search_context(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        technologies: Sequence[str] = (),
+        rag_metadata: Sequence[Mapping[str, Any]] = (),
+    ) -> Sequence[EvidenceFragment]:
+        """Compatibilidad para proveedores sin priorización contextual."""
+        return self.search(query, limit=limit)
+
+    def search_audit(self) -> Mapping[str, Any] | None:
+        return None
+
 
 class EvidenceSufficiencyEvaluator(ABC):
     @abstractmethod
@@ -205,6 +219,7 @@ class ResearcherAgent(BaseAgent):
             raise TypeError("task_state debe ser una instancia de TaskState.")
         queries: list[ResearchQuery] = []
         rag_audit: Mapping[str, Any] | None = None
+        web_audit: Mapping[str, Any] | None = None
         try:
             query = self.build_research_query(instruction, task_state, context)
 
@@ -233,8 +248,15 @@ class ResearcherAgent(BaseAgent):
             if web_needed and self.web_search is not None:
                 queries.append(ResearchQuery("web", query))
                 web = self._validate_fragments(
-                    self.web_search.search(query, limit=5), "web"
+                    self.web_search.search_context(
+                        query,
+                        limit=5,
+                        technologies=self._detected_technologies(task_state),
+                        rag_metadata=self._rag_metadata(rag_audit),
+                    ),
+                    "web",
                 )
+                web_audit = self.web_search.search_audit()
                 fragments.extend(web)
                 web_used = True
                 final_assessment = self.sufficiency_evaluator.evaluate(query, fragments)
@@ -291,6 +313,11 @@ class ResearcherAgent(BaseAgent):
             task_state.add_observation(
                 "RAG trace: "
                 + json.dumps(self._compact_rag_audit(rag_audit), ensure_ascii=False)
+            )
+        if web_audit:
+            task_state.add_observation(
+                "WEB trace: "
+                + json.dumps(self._compact_web_audit(web_audit), ensure_ascii=False)
             )
         return ResearcherResult(
             queries_performed=tuple(queries),
@@ -390,6 +417,59 @@ class ResearcherAgent(BaseAgent):
             "documents": audit.get("documents", []),
             "conclusions": audit.get("conclusions", []),
             "sufficiency": audit.get("sufficiency", {}),
+        }
+
+    @staticmethod
+    def _detected_technologies(state: TaskState) -> tuple[str, ...]:
+        categories = {
+            "technology", "language", "framework", "test_framework",
+            "tool", "build_system",
+        }
+        values = []
+        for finding in state.repository_findings:
+            prefix, separator, remainder = finding.partition("=")
+            if separator and prefix.strip().casefold() in categories:
+                value = remainder.split(";", 1)[0].strip()
+                if value:
+                    values.append(value)
+        return tuple(dict.fromkeys(values))
+
+    @staticmethod
+    def _rag_metadata(
+        audit: Mapping[str, Any] | None,
+    ) -> tuple[Mapping[str, Any], ...]:
+        if not audit or not isinstance(audit.get("used_chunks"), list):
+            return ()
+        return tuple(
+            item["metadata"]
+            for item in audit["used_chunks"]
+            if isinstance(item, dict) and isinstance(item.get("metadata"), dict)
+        )
+
+    @staticmethod
+    def _compact_web_audit(audit: Mapping[str, Any]) -> dict[str, Any]:
+        def results(name: str) -> list[dict[str, Any]]:
+            values = audit.get(name)
+            if not isinstance(values, list):
+                return []
+            return [
+                {
+                    "url": item.get("url"),
+                    "title": item.get("title"),
+                    "snippet": item.get("snippet"),
+                    "domain": item.get("domain"),
+                    "priority": item.get("priority"),
+                }
+                for item in values
+                if isinstance(item, dict)
+            ]
+
+        return {
+            "query": audit.get("query"),
+            "executed_queries": audit.get("executed_queries", []),
+            "found": results("found"),
+            "used": results("used"),
+            "conclusions": audit.get("conclusions", []),
         }
 
     def _synthesize(

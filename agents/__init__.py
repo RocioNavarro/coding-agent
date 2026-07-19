@@ -59,6 +59,12 @@ from agents.tester import (
     ValidationExecutor,
     ValidationSafetyPolicy,
 )
+from agents.web_research import (
+    ConfiguredWebSearchProvider,
+    WebResultRecord,
+    WebSearchConfig,
+    WebSearchTrace,
+)
 from agents.reviewer import (
     DiffProvider,
     DiffSnapshot,
@@ -75,6 +81,7 @@ __all__ = [
     "BaseAgent",
     "BuildSystemDetector",
     "ContextManager",
+    "ConfiguredWebSearchProvider",
     "DiffProvider",
     "DiffSnapshot",
     "ExplorerAgent",
@@ -121,6 +128,9 @@ __all__ = [
     "ValidationExecutor",
     "ValidationSafetyPolicy",
     "WebSearchProvider",
+    "WebResultRecord",
+    "WebSearchConfig",
+    "WebSearchTrace",
     "WritePolicy",
     "build_explorer_registry",
 ]
