@@ -6,9 +6,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from core.harness import run_internal_loop
+from core.harness import run_internal_loop, run_planning_loop
 from core.llm_client import LLMClient, LLMClientError, OpenAILLMClient
-from core.models import Message
+from core.models import Message, PlanReview
 from core.settings import AgentSettings
 from core.supervision import ConfirmationCallback
 from tools.definitions import ToolDefinition
@@ -71,6 +71,7 @@ def run_chat(
     """Ejecuta el loop externo y devuelve el historial al finalizar."""
     history = [Message(role="system", content=SYSTEM_PROMPT)]
     approval = confirm or _interactive_confirmation(input_func, output)
+    plan_review = _interactive_plan_review(input_func, output)
 
     while True:
         try:
@@ -95,6 +96,37 @@ def run_chat(
 
         history.append(Message(role="user", content=message))
         try:
+            if settings.plan_mode_enabled:
+                planning = run_planning_loop(
+                    llm_client,
+                    history,
+                    plan_review,
+                    max_revisions=settings.max_iterations,
+                    output=output,
+                )
+                if not planning.approved:
+                    history.append(
+                        Message(
+                            role="assistant",
+                            content="Tarea cancelada por el usuario durante plan mode.",
+                        )
+                    )
+                    output("Tarea cancelada.")
+                    continue
+                assert planning.plan is not None
+                history.append(
+                    Message(role="assistant", content=planning.plan)
+                )
+                history.append(
+                    Message(
+                        role="developer",
+                        content=(
+                            "El usuario aprobó el plan anterior. Ejecutalo ahora usando "
+                            "las tools disponibles cuando corresponda."
+                        ),
+                    )
+                )
+
             result = run_internal_loop(
                 llm_client,
                 tool_registry,
@@ -132,6 +164,31 @@ def _interactive_confirmation(
         return approved
 
     return confirm
+
+
+def _interactive_plan_review(
+    input_func: InputCallback, output: OutputCallback
+) -> Callable[[str], PlanReview]:
+    """Crea el diálogo de aprobación, rechazo o modificación de planes."""
+
+    def review(plan: str) -> PlanReview:
+        while True:
+            answer = input_func(
+                "Plan: [a]probar, [r]echazar o [m]odificar: "
+            ).strip().lower()
+            if answer in {"a", "aprobar"}:
+                return PlanReview("approve")
+            if answer in {"r", "rechazar"}:
+                return PlanReview("reject")
+            if answer in {"m", "modificar"}:
+                modification = input_func("Modificación solicitada: ").strip()
+                if modification:
+                    return PlanReview("modify", modification)
+                output("La modificación no puede estar vacía.")
+                continue
+            output("Opción inválida. Usá a, r o m.")
+
+    return review
 
 
 def _format_status(settings: AgentSettings) -> str:

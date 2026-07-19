@@ -8,13 +8,14 @@ from collections.abc import Callable
 from typing import Any
 
 from core.llm_client import LLMClient
-from core.models import InternalLoopResult, Message
+from core.models import InternalLoopResult, Message, PlanningResult, PlanReview
 from core.settings import AgentSettings
 from core.supervision import ConfirmationCallback, SupervisedToolExecutor
 from tools.registry import ToolRegistry
 
 
 OutputCallback = Callable[[str], None]
+PlanReviewer = Callable[[str], PlanReview]
 _SECRET_FIELD = re.compile(r"(?:api[_-]?key|password|secret|token)", re.IGNORECASE)
 _SECRET_VALUE = re.compile(
     r"(?i)(api[_-]?key|password|secret|token)(\s*[=:]\s*)([^\s,;]+)"
@@ -29,6 +30,63 @@ class MaxIterationsError(RuntimeError):
             f"Se alcanzó el máximo de {max_iterations} iteraciones sin una respuesta final."
         )
         self.max_iterations = max_iterations
+
+
+class PlanningError(RuntimeError):
+    """No fue posible obtener un plan válido y aprobado."""
+
+
+def run_planning_loop(
+    llm_client: LLMClient,
+    history: list[Message],
+    review: PlanReviewer,
+    *,
+    max_revisions: int,
+    output: OutputCallback = print,
+) -> PlanningResult:
+    """Genera y revisa planes sin exponer schemas ni modificar el historial principal."""
+    planning_history = list(history)
+    planning_history.append(
+        Message(
+            role="developer",
+            content=(
+                "Proponé un plan numerado, concreto y breve para resolver el último "
+                "pedido. No ejecutes acciones ni afirmes que ya fueron realizadas."
+            ),
+        )
+    )
+
+    for _ in range(max_revisions):
+        response = llm_client.complete(planning_history, ())
+        plan = response.text.strip()
+        if response.tool_calls:
+            raise PlanningError("El LLM intentó usar tools durante la planificación.")
+        if not plan:
+            raise PlanningError("El LLM devolvió un plan vacío.")
+
+        output(f"Plan propuesto:\n{plan}")
+        decision = review(plan)
+        if decision.action == "approve":
+            return PlanningResult(approved=True, plan=plan)
+        if decision.action == "reject":
+            return PlanningResult(approved=False)
+        if decision.action != "modify" or not decision.modification:
+            raise PlanningError("La modificación solicitada no es válida.")
+
+        planning_history.append(response.assistant_message)
+        planning_history.append(
+            Message(
+                role="developer",
+                content=(
+                    "El usuario solicita modificar el plan de esta manera: "
+                    f"{decision.modification}. Generá un nuevo plan completo."
+                ),
+            )
+        )
+
+    raise PlanningError(
+        f"Se alcanzó el máximo de {max_revisions} revisiones del plan."
+    )
 
 
 def run_internal_loop(

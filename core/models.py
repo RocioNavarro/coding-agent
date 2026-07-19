@@ -53,3 +53,22 @@ class InternalLoopResult:
 
     response: LLMResponse
     iterations: int
+
+
+PlanReviewAction = Literal["approve", "reject", "modify"]
+
+
+@dataclass(frozen=True)
+class PlanReview:
+    """Decisión humana sobre un plan generado por el modelo."""
+
+    action: PlanReviewAction
+    modification: str | None = None
+
+
+@dataclass(frozen=True)
+class PlanningResult:
+    """Resultado de la fase de planificación previa a las tools."""
+
+    approved: bool
+    plan: str | None = None
