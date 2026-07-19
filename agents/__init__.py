@@ -14,6 +14,15 @@ from agents.repository_detection import (
     RepositoryDetector,
     TechnologyDetector,
 )
+from agents.researcher import (
+    EvidenceFragment,
+    EvidenceSufficiencyEvaluator,
+    KnowledgeRetriever,
+    ProjectMemoryProvider,
+    ResearcherAgent,
+    ResearcherResult,
+    WebSearchProvider,
+)
 
 __all__ = [
     "AgentContext",
@@ -23,9 +32,16 @@ __all__ = [
     "BuildSystemDetector",
     "ExplorerAgent",
     "ExplorerReport",
+    "EvidenceFragment",
+    "EvidenceSufficiencyEvaluator",
+    "KnowledgeRetriever",
     "LanguageDetector",
     "RepositoryDetector",
+    "ProjectMemoryProvider",
+    "ResearcherAgent",
+    "ResearcherResult",
     "StubAgent",
     "TechnologyDetector",
+    "WebSearchProvider",
     "build_explorer_registry",
 ]
