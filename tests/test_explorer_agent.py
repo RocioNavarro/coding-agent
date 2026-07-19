@@ -9,6 +9,7 @@ import pytest
 
 from agents.base import AgentExecutionError
 from agents.explorer import EXPLORER_ALLOWED_TOOLS, ExplorerAgent
+from agents.project_memory import ProjectMemory
 from agents.repository_detection import (
     DetectionEvidence,
     RepositoryDetection,
@@ -142,6 +143,34 @@ def test_detects_python_structure_technologies_and_commands(
     assert "src/service/app.py" in report.inventory.entry_points
     assert "build/generated.py" not in report.inventory.files
     assert "src/service/app.py" in report.relevant_files
+
+
+def test_records_detected_repository_information_in_project_memory(
+    python_repository: Path, tmp_path: Path
+) -> None:
+    memory = ProjectMemory(
+        python_repository, storage_root=tmp_path / "persistent-memory"
+    )
+    explorer = ExplorerAgent(
+        repository_root=python_repository,
+        llm_client=FakeExplorerLLM(),
+        project_memory=memory,
+    )
+
+    explorer.run(
+        "Modificar el endpoint de app",
+        TaskState.create("Modificar el endpoint de app"),
+    )
+    persisted = ProjectMemory(
+        python_repository, storage_root=tmp_path / "persistent-memory"
+    ).load().data
+
+    assert {"Python", "Python packaging", "FastAPI", "pytest", "Ruff"} <= set(
+        persisted["technologies"]
+    )
+    assert "fastapi" in {dependency.casefold() for dependency in persisted["dependencies"]}
+    assert any(item["command"] == "python -m pytest" for item in persisted["known_commands"])
+    assert "src/service/app.py" in persisted["important_files"]
 
 
 def test_detects_javascript_framework_tools_and_package_scripts(

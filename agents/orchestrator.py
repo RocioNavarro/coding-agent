@@ -9,6 +9,11 @@ from typing import Literal, Protocol, Sequence
 
 from agents.base import AgentExecutionError
 from agents.implementer import ImplementerResult
+from agents.project_memory import (
+    MemoryCorruptionError,
+    ProjectMemory,
+    ProjectMemoryError,
+)
 from agents.researcher import ResearcherResult
 from agents.reviewer import ReviewerResult
 from agents.tester import TesterResult
@@ -199,6 +204,7 @@ class MainAgent:
         implementer: ImplementerRunner | None,
         tester: TesterRunner | None,
         reviewer: ReviewerRunner | None,
+        project_memory: ProjectMemory | None = None,
         presenter: ResultPresenter | None = None,
         max_iterations: int = 3,
         minimum_evidence_confidence: float = 0.5,
@@ -214,9 +220,11 @@ class MainAgent:
         self.implementer = implementer
         self.tester = tester
         self.reviewer = reviewer
+        self.project_memory = project_memory
         self.presenter = presenter or TextResultPresenter()
         self.max_iterations = max_iterations
         self.minimum_evidence_confidence = minimum_evidence_confidence
+        self._memory_available = True
 
     def run(
         self,
@@ -227,7 +235,10 @@ class MainAgent:
     ) -> OrchestrationResult:
         state = TaskState.create(request, task_id=task_id)
         selected: list[str] = []
+        self._memory_available = True
         try:
+            if self.project_memory is not None:
+                self.project_memory.load()
             state.set_status("running")
             state.set_phase("analysis")
             analysis = self.task_analyzer.analyze(request)
@@ -343,6 +354,18 @@ class MainAgent:
                 f"Se alcanzó el máximo de {self.max_iterations} iteraciones."
             )
             return self._result("max_iterations", state, self.max_iterations, selected)
+        except MemoryCorruptionError as error:
+            self._memory_available = False
+            state.record_error(
+                ErrorRecord(str(error), state.current_phase, "project_memory", False)
+            )
+            return self._blocked(state, selected, 0, str(error))
+        except ProjectMemoryError as error:
+            self._memory_available = False
+            state.record_error(
+                ErrorRecord(str(error), state.current_phase, "project_memory", True)
+            )
+            return self._blocked(state, selected, 0, str(error))
         except (PermissionError, AgentExecutionError) as error:
             state.record_error(
                 ErrorRecord(str(error), state.current_phase, "main_agent", True)
@@ -381,6 +404,17 @@ class MainAgent:
         iterations: int,
         selected: Sequence[str],
     ) -> OrchestrationResult:
+        if self.project_memory is not None and self._memory_available:
+            try:
+                self.project_memory.load()
+                self.project_memory.save_task_summary(state)
+                self.project_memory.save()
+            except ProjectMemoryError as error:
+                self._memory_available = False
+                state.record_error(
+                    ErrorRecord(str(error), state.current_phase, "project_memory", True)
+                )
+                state.add_warning("No se pudo persistir el resumen de la tarea.")
         final = self.presenter.present(state)
         return OrchestrationResult(
             status, state, final, iterations, tuple(dict.fromkeys(selected))

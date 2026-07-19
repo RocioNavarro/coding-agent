@@ -27,6 +27,11 @@ from agents.orchestrator import (
     TaskAnalyzer,
     TextResultPresenter,
 )
+from agents.project_memory import (
+    MemoryCorruptionError,
+    ProjectMemory,
+    ProjectMemoryError,
+)
 from agents.repository_detection import (
     BuildSystemDetector,
     LanguageDetector,
@@ -85,11 +90,14 @@ __all__ = [
     "LLMPlanGenerator",
     "LLMTaskAnalyzer",
     "MainAgent",
+    "MemoryCorruptionError",
     "OrchestrationResult",
     "PlanGenerator",
     "ResultPresenter",
     "RepositoryDetector",
     "ProjectMemoryProvider",
+    "ProjectMemory",
+    "ProjectMemoryError",
     "ResearcherAgent",
     "ResearcherResult",
     "ReviewIssue",

@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 from agents.orchestrator import MainAgent, TaskAnalysis
+from agents.project_memory import ProjectMemory
 from core.models import PlanReview
 from core.task_state import SourceReference, SubagentResult, TaskState
 
@@ -259,3 +260,21 @@ def test_stops_when_research_evidence_is_insufficient() -> None:
     assert planner.feedback == []
     assert implementer.calls == tester.calls == reviewer.calls == 0
     assert "evidencia técnica es insuficiente" in result.final_response
+
+
+def test_main_agent_loads_memory_and_persists_session_summary(tmp_path) -> None:
+    workspace = tmp_path / "repository"
+    workspace.mkdir()
+    memory = ProjectMemory(workspace, storage_root=tmp_path / "memory")
+    memory.add_decision("Conservar compatibilidad")
+    memory.save()
+    agent, _, _, _, _ = build_agent(kind="analysis")
+    agent.project_memory = memory
+
+    result = agent.run("Analizar arquitectura", approve, task_id="memory-task")
+
+    persisted = ProjectMemory(workspace, storage_root=tmp_path / "memory").load().data
+    assert result.status == "completed"
+    assert persisted["decisions"][0]["decision"] == "Conservar compatibilidad"
+    assert persisted["previous_tasks"][0]["task_id"] == "memory-task"
+    assert persisted["session_summaries"][0]["agents"] == ["explorer"]

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Sequence
 
 from agents.base import AgentContext, BaseAgent
+from agents.project_memory import ProjectMemory
 from agents.repository_detection import (
     BuildSystemDetector,
     DetectionEvidence,
@@ -27,7 +28,7 @@ EXPLORER_ALLOWED_TOOLS = frozenset(
     {"list_files", "find_files", "read_file", "search_text"}
 )
 IGNORED_DIRECTORIES = frozenset(
-    {".git", ".gradle", ".idea", ".mypy_cache", ".pytest_cache", ".venv",
+    {".coding-agent", ".git", ".gradle", ".idea", ".mypy_cache", ".pytest_cache", ".venv",
      "__pycache__", "build", "dist", "node_modules", "out", "target", "vendor"}
 )
 MAX_DISCOVERED_FILES = 5_000
@@ -132,6 +133,7 @@ class ExplorerAgent(BaseAgent):
         repository_root: str | Path,
         llm_client: LLMClient,
         detectors: Sequence[RepositoryDetector] | None = None,
+        project_memory: ProjectMemory | None = None,
         name: str = "explorer",
     ) -> None:
         super().__init__(
@@ -145,6 +147,7 @@ class ExplorerAgent(BaseAgent):
         if not root.is_dir():
             raise ValueError("repository_root debe ser un directorio existente.")
         self.repository_root = root
+        self.project_memory = project_memory
         self.detectors = tuple(
             detectors
             if detectors is not None
@@ -169,6 +172,7 @@ class ExplorerAgent(BaseAgent):
     ) -> SubagentResult:
         report = self.explore(instruction)
         self._record_report(report, task_state)
+        self._record_memory(report)
         existing = context or AgentContext()
         bounded_context = AgentContext(
             facts=(*existing.facts, *report.facts()),
@@ -366,6 +370,31 @@ class ExplorerAgent(BaseAgent):
                 )
         for path in report.inventory.files_inspected:
             state.record_file_read(path)
+
+    def _record_memory(self, report: ExplorerReport) -> None:
+        if self.project_memory is None:
+            return
+        self.project_memory.load()
+        self.project_memory.update_project_summary(report.architecture_summary)
+        self.project_memory.update_architecture(report.architecture_summary)
+        for directory in report.inventory.directories:
+            if "/" not in directory:
+                self.project_memory.add_module(directory)
+        for path in report.relevant_files:
+            self.project_memory.add_important_file(path)
+        for detection in report.detections:
+            if detection.category in {
+                "language", "framework", "test_framework", "tool", "build_system"
+            }:
+                self.project_memory.add_technology(detection.name)
+            if detection.category in {"dependency", "build_system", "framework"}:
+                self.project_memory.add_dependency(detection.name)
+            evidence = ", ".join(item.path for item in detection.evidence)
+            for command in detection.commands:
+                self.project_memory.add_known_command(command, evidence)
+        for convention in report.conventions:
+            self.project_memory.add_convention(convention.name)
+        self.project_memory.save()
 
     @staticmethod
     def _is_configuration(path: str) -> bool:
