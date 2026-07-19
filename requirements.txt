@@ -1,5 +1,6 @@
 # Alternativa compatible con `pip install -e ".[dev]`.
 # pyproject.toml es la fuente principal de dependencias.
 openai>=1.0.0,<3.0.0
+python-dotenv>=1.0.0,<2.0.0
 tavily-python>=0.5.0,<1.0.0
 pytest>=8.0.0,<10.0.0

@@ -132,9 +132,17 @@ def test_two_successive_tool_calls_then_final_response() -> None:
     assert fake_llm.histories[1][-1].tool_call_id == "call-write"
     assert fake_llm.histories[2][-1].tool_call_id == "call-run"
     assert log[0] == "--- Iteración 1 ---"
+    assert "El agente quiere modificar hello.py." in log
     assert "Tool: write_file" in log
+    assert any("content: <15 caracteres; contenido omitido>" in line for line in log)
+    assert "El agente quiere ejecutar el comando: python hello.py." in log
     assert "Tool: run_command" in log
-    assert log[-1] == "--- Iteración 3 ---"
+    assert log[-1] == "\n--- Iteración 3 ---"
+
+    rendered_log = "\n".join(log)
+    assert "\n\n--- Iteración 2 ---" in rendered_log
+    assert "\n\n--- Iteración 3 ---" in rendered_log
+    assert "\n\n\n--- Iteración" not in rendered_log
 
 
 def test_rejected_write_file_is_added_to_history() -> None:
@@ -220,4 +228,53 @@ def test_visible_log_redacts_secrets_and_truncates_large_content() -> None:
 
     rendered = "\n".join(log)
     assert "forbidden" not in rendered
+    assert "content: <1000 caracteres; contenido omitido>" in rendered
+    assert "x" * 100 not in rendered
+
+
+def test_long_tool_result_is_truncated_without_hiding_status() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="read_file",
+            description="Lee.",
+            parameters={
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+            executor=lambda path: "contenido " * 100,
+            modifies_system=False,
+        )
+    )
+    fake_llm = FakeLLMClient([
+        llm_response(tool_calls=[ToolCall("read", "read_file", {"path": "large.txt"})]),
+        llm_response("Listo"),
+    ])
+    log: list[str] = []
+
+    run_internal_loop(
+        fake_llm, registry, AgentSettings(),
+        [Message(role="user", content="Leé")], output=log.append,
+    )
+
+    rendered = "\n".join(log)
+    assert "El agente está leyendo large.txt." in rendered
+    assert "estado: ok" in rendered
     assert "[truncado]" in rendered
+
+
+def test_tool_error_remains_visible_in_formatted_output() -> None:
+    call = ToolCall("missing", "unknown", {"path": "file.txt"})
+    fake_llm = FakeLLMClient([llm_response(tool_calls=[call]), llm_response("Listo")])
+    log: list[str] = []
+
+    run_internal_loop(
+        fake_llm, ToolRegistry(), AgentSettings(),
+        [Message(role="user", content="Intentá")], output=log.append,
+    )
+
+    rendered = "\n".join(log)
+    assert "estado: error" in rendered
+    assert "no está registrada" in rendered

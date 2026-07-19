@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+from dotenv import load_dotenv
 
 from core.harness import run_internal_loop, run_planning_loop
 from core.llm_client import LLMClient, LLMClientError, OpenAILLMClient
@@ -19,8 +22,16 @@ InputCallback = Callable[[str], str]
 OutputCallback = Callable[[str], None]
 SYSTEM_PROMPT = (
     "Sos un coding agent. Usá las tools disponibles cuando sean necesarias, "
-    "respetá el workspace y nunca expongas secretos ni ejecutes acciones destructivas."
+    "respetá el workspace y nunca expongas secretos ni ejecutes acciones destructivas. "
+    "En la respuesta final explicá en lenguaje natural, cuando corresponda, qué "
+    "encontraste, qué cambiaste, cómo lo verificaste, qué archivos modificaste y "
+    "cuál fue el resultado de los tests."
 )
+
+
+def load_environment(dotenv_path: str | Path | None = None) -> None:
+    """Carga variables desde ``.env`` sin imprimir ni devolver secretos."""
+    load_dotenv(dotenv_path=dotenv_path)
 
 
 @dataclass(frozen=True)
@@ -126,6 +137,7 @@ def run_chat(
                         ),
                     )
                 )
+                output("")
 
             result = run_internal_loop(
                 llm_client,
@@ -145,8 +157,9 @@ def run_chat(
             output(f"Error: {error}")
             continue
 
-        output(f"Asistente: {result.response.text}")
-        output(f"Iteraciones: {result.iterations}")
+        output("--- Respuesta final ---")
+        output(result.response.text)
+        output(f"Iteraciones del turno: {result.iterations}")
 
     return history
 
@@ -157,7 +170,7 @@ def _interactive_confirmation(
     """Crea el callback de aprobación usado por tools supervisadas."""
 
     def confirm(tool: ToolDefinition, arguments: dict[str, Any]) -> bool:
-        answer = input_func(f"¿Aprobar {tool.name}? [s/N]: ").strip().lower()
+        answer = input_func(f"¿Aprobar {tool.name}? [s/n]: ").strip().lower()
         approved = answer in {"s", "si", "sí", "y", "yes"}
         if not approved:
             output(f"Tool rechazada: {tool.name}")
@@ -173,9 +186,10 @@ def _interactive_plan_review(
 
     def review(plan: str) -> PlanReview:
         while True:
-            answer = input_func(
+            raw_answer = input_func(
                 "Plan: [a]probar, [r]echazar o [m]odificar: "
-            ).strip().lower()
+            )
+            answer = raw_answer.strip().lower()
             if answer in {"a", "aprobar"}:
                 return PlanReview("approve")
             if answer in {"r", "rechazar"}:
@@ -210,6 +224,7 @@ def _on_off(enabled: bool) -> str:
 def main() -> None:
     """Construye las dependencias concretas e inicia el chat."""
     try:
+        load_environment()
         settings = AgentSettings()
         client = OpenAILLMClient()
         registry = build_default_registry()

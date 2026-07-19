@@ -143,8 +143,12 @@ def test_missing_configuration_is_rejected(
     monkeypatch.setenv("OPENAI_MODEL", "env-model")
     monkeypatch.delenv(missing)
 
-    with pytest.raises(LLMConfigurationError, match=missing):
+    with pytest.raises(LLMConfigurationError, match=missing) as error:
         OpenAILLMClient(client=Mock())
+
+    message = str(error.value)
+    assert "env-key" not in message
+    assert "env-model" not in message
 
 
 def test_invalid_tool_schema_is_rejected_before_sdk_call() -> None:

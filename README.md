@@ -1,8 +1,15 @@
 # Coding Agent — Parte 1
 
+## Objetivo
+
 Coding agent educativo implementado desde cero en Python, sin frameworks de
 orquestación. Conecta la Responses API de OpenAI con tools locales mediante tool
 calling, conserva el historial y ofrece planificación y supervisión interactivas.
+
+El alcance de la Parte 1 es permitir que un usuario converse con el agente para
+explorar y modificar proyectos ubicados en `workspace/`, ejecutar verificaciones
+y consultar la web, manteniendo control explícito sobre la planificación y las
+operaciones sensibles.
 
 ## Requisitos
 
@@ -40,16 +47,16 @@ python -m pip install -r requirements.txt
 
 ## Variables de entorno
 
-El programa no carga archivos `.env` automáticamente. Se pueden exportar las
-variables directamente o partir de `.env.example` y cargarlas en el shell:
+El programa carga automáticamente el archivo `.env` de la raíz al iniciar. Se
+puede crear a partir del ejemplo:
 
 ```bash
 cp .env.example .env
 # Completar .env sin commitearlo.
-set -a
-source .env
-set +a
 ```
+
+Las variables ya exportadas en el entorno tienen prioridad sobre los valores de
+`.env`.
 
 Variables requeridas:
 
@@ -138,23 +145,63 @@ permisos del sistema operativo u otra tecnología fuera del alcance de esta part
 ## Tests
 
 ```bash
-pytest
+python -m pytest tests
 ```
 
 Los clientes de OpenAI y Tavily se prueban con mocks; la suite no consume APIs ni
 internet. Los tests cubren loops, historial, planificación, supervisión, tools,
 límites, errores y políticas de seguridad.
 
-## Demostraciones pendientes
+## Ejemplos de uso
 
-Las dos corridas entregables —corrección de un bug e implementación de código
-nuevo— se prepararán y documentarán cuando termine completamente la Parte 1. En
-esta etapa no se incluyen proyectos demo ni se inventan resultados de ejecución.
+Los siguientes pedidos se pueden ingresar en el chat después de ejecutar
+`python main.py`. Los resultados dependen del modelo configurado y deben revisarse
+antes de aprobar planes u operaciones sensibles.
+
+### Ejemplo 1: diagnosticar y corregir un bug
+
+El proyecto inicial está en `workspace/bug_demo/`. Prompt sugerido:
+
+> Explorá el proyecto bug_demo, encontrá por qué fallan los tests, corregí el
+> problema y verificá que todos los tests pasen.
+
+### Ejemplo 2: implementar funcionalidad nueva
+
+El proyecto inicial está en `workspace/palindrome_demo/`. Prompt sugerido:
+
+> En palindrome_demo, creá una función is_palindrome que ignore mayúsculas,
+> espacios y signos de puntuación. Agregá tests y verificá que pasen.
+
+Estos ejemplos no documentan resultados todavía. Las dos corridas entregables se
+registrarán una vez terminada la implementación completa de la Parte 1.
+
+## Evidencias
+
+Esta sección queda preparada para pegar evidencias reales. No completar campos sin
+haber ejecutado y verificado la corrida correspondiente.
+
+### Corrida 1
+
+- Output o enlace a la evidencia:
+- Cantidad de iteraciones:
+- Qué salió bien:
+- Qué salió mal:
+
+### Corrida 2
+
+- Output o enlace a la evidencia:
+- Cantidad de iteraciones:
+- Qué salió bien:
+- Qué salió mal:
+
+### Mejoras futuras
+
+- Pendiente de completar después de analizar ambas corridas.
 
 ## Limitaciones y trabajo futuro
 
 - `run_command` aplica reglas explícitas, pero no es un sandbox de sistema operativo.
-- Las variables de `.env` deben cargarse en el entorno antes de iniciar el programa.
+- `.env` se carga al iniciar y debe permanecer fuera del control de versiones.
 - La calidad de planes y tool calls depende del modelo configurado.
-- No se incluyen todavía las corridas demostrativas entregables.
+- Las corridas demostrativas todavía no tienen evidencias ni resultados documentados.
 - Funcionalidades adicionales quedan fuera del alcance de la Parte 1.
