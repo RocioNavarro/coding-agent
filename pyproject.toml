@@ -17,6 +17,9 @@ dev = [
     "pytest>=8.0.0,<10.0.0",
 ]
 
+[project.scripts]
+coding-agent-index = "rag.cli:main"
+
 [tool.setuptools]
-packages = ["agents", "core", "security", "tools"]
+packages = ["agents", "core", "rag", "security", "tools"]
 py-modules = ["main"]
