@@ -43,6 +43,14 @@ from agents.tester import (
     ValidationExecutor,
     ValidationSafetyPolicy,
 )
+from agents.reviewer import (
+    DiffProvider,
+    DiffSnapshot,
+    GitDiffProvider,
+    ReviewIssue,
+    ReviewerAgent,
+    ReviewerResult,
+)
 
 __all__ = [
     "AgentContext",
@@ -51,11 +59,14 @@ __all__ = [
     "BaseAgent",
     "BuildSystemDetector",
     "ContextManager",
+    "DiffProvider",
+    "DiffSnapshot",
     "ExplorerAgent",
     "ExplorerReport",
     "EvidenceFragment",
     "EvidenceSufficiencyEvaluator",
     "KnowledgeRetriever",
+    "GitDiffProvider",
     "ImplementerAgent",
     "ImplementerBlockedError",
     "ImplementerResult",
@@ -64,6 +75,9 @@ __all__ = [
     "ProjectMemoryProvider",
     "ResearcherAgent",
     "ResearcherResult",
+    "ReviewIssue",
+    "ReviewerAgent",
+    "ReviewerResult",
     "StubAgent",
     "StateContextManager",
     "StaticCommandProvider",
