@@ -9,7 +9,7 @@ from core.task_state import TaskState
 
 
 class ContextManager(ABC):
-    """Contrato para seleccionar contexto sin exponer todo el estado compartido."""
+    """Contrato para seleccionar contexto sin exponer el estado compartido."""
 
     @abstractmethod
     def select(
