@@ -18,5 +18,5 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = ["core", "security", "tools"]
+packages = ["agents", "core", "security", "tools"]
 py-modules = ["main"]

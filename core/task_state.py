@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal, Mapping
 from uuid import uuid4
 
+from core.models import ToolCall
+
 
 SourceOrigin = Literal["repository", "project_memory", "rag", "web", "inference"]
 SOURCE_ORIGINS: frozenset[str] = frozenset(
@@ -53,6 +55,14 @@ class SubagentResult:
     status: str
     result: str | None = None
     error: str | None = None
+    summary: str | None = None
+    findings: tuple[str, ...] = ()
+    recommendations: tuple[str, ...] = ()
+    requested_tool_calls: tuple[ToolCall, ...] = ()
+    sources: tuple[SourceReference, ...] = ()
+    files_relevant: tuple[str, ...] = ()
+    blockers: tuple[str, ...] = ()
+    confidence: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "subagent_id", _required_text(self.subagent_id, "subagent_id"))
@@ -60,6 +70,38 @@ class SubagentResult:
         object.__setattr__(self, "status", _required_text(self.status, "status"))
         object.__setattr__(self, "result", _optional_text(self.result, "result"))
         object.__setattr__(self, "error", _optional_text(self.error, "error"))
+        object.__setattr__(self, "summary", _optional_text(self.summary, "summary"))
+        for field_name in (
+            "findings", "recommendations", "files_relevant", "blockers"
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, (list, tuple)):
+                raise ValueError(f"{field_name} debe ser una lista o tupla.")
+            object.__setattr__(
+                self,
+                field_name,
+                tuple(_required_text(item, field_name) for item in value),
+            )
+        if not isinstance(self.requested_tool_calls, (list, tuple)) or not all(
+            isinstance(item, ToolCall) for item in self.requested_tool_calls
+        ):
+            raise ValueError("requested_tool_calls debe contener instancias de ToolCall.")
+        object.__setattr__(
+            self, "requested_tool_calls", tuple(self.requested_tool_calls)
+        )
+        if not isinstance(self.sources, (list, tuple)) or not all(
+            isinstance(item, SourceReference) for item in self.sources
+        ):
+            raise ValueError("sources debe contener instancias de SourceReference.")
+        object.__setattr__(self, "sources", tuple(self.sources))
+        if self.confidence is not None:
+            if (
+                isinstance(self.confidence, bool)
+                or not isinstance(self.confidence, (int, float))
+                or not 0 <= self.confidence <= 1
+            ):
+                raise ValueError("confidence debe estar entre 0 y 1.")
+            object.__setattr__(self, "confidence", float(self.confidence))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -68,6 +110,17 @@ class SubagentResult:
             "status": self.status,
             "result": self.result,
             "error": self.error,
+            "summary": self.summary,
+            "findings": list(self.findings),
+            "recommendations": list(self.recommendations),
+            "requested_tool_calls": [
+                {"id": call.id, "name": call.name, "arguments": deepcopy(call.arguments)}
+                for call in self.requested_tool_calls
+            ],
+            "sources": [source.to_dict() for source in self.sources],
+            "files_relevant": list(self.files_relevant),
+            "blockers": list(self.blockers),
+            "confidence": self.confidence,
         }
 
     @classmethod
@@ -80,6 +133,24 @@ class SubagentResult:
                 status=values["status"],
                 result=values.get("result"),
                 error=values.get("error"),
+                summary=values.get("summary"),
+                findings=tuple(values.get("findings", [])),
+                recommendations=tuple(values.get("recommendations", [])),
+                requested_tool_calls=tuple(
+                    ToolCall(
+                        id=call["id"],
+                        name=call["name"],
+                        arguments=_require_mapping(call["arguments"], "arguments"),
+                    )
+                    for call in values.get("requested_tool_calls", [])
+                ),
+                sources=tuple(
+                    SourceReference.from_dict(source)
+                    for source in values.get("sources", [])
+                ),
+                files_relevant=tuple(values.get("files_relevant", [])),
+                blockers=tuple(values.get("blockers", [])),
+                confidence=values.get("confidence"),
             )
         except KeyError as error:
             raise ValueError(f"Falta el campo requerido: {error.args[0]}.") from error
