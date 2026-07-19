@@ -2,23 +2,14 @@
 
 import shlex
 import subprocess
-from pathlib import Path
 from typing import TypedDict
 
 from core.settings import DEFAULT_SETTINGS
-from security.paths import PathSecurityError, WORKSPACE_ROOT, resolve_workspace_path
+from security.command_policy import CommandPolicyError, validate_command
+from security.paths import WORKSPACE_ROOT
 
 
 COMMAND_TIMEOUT_SECONDS = DEFAULT_SETTINGS.command_timeout_seconds
-DESTRUCTIVE_COMMANDS = {
-    "dd",
-    "mkfs",
-    "rmdir",
-    "rm",
-    "shred",
-}
-
-
 class CommandResult(TypedDict):
     """Resultado estable de la ejecución de un comando."""
 
@@ -32,23 +23,12 @@ def _error_result(message: str) -> CommandResult:
     return {"exit_code": -1, "stdout": "", "stderr": message}
 
 
-def _validate_command(arguments: list[str]) -> None:
-    """Rechaza comandos destructivos y argumentos que escapen del workspace."""
-    executable = Path(arguments[0]).name.lower()
-    if executable in DESTRUCTIVE_COMMANDS:
-        raise ValueError(f"El comando destructivo '{executable}' no está permitido.")
-
-    for argument in arguments[1:]:
-        if argument.startswith("-"):
-            continue
-
-        candidate = Path(argument)
-        if candidate.is_absolute() or ".." in candidate.parts:
-            resolve_workspace_path(candidate)
-
-
 def run_command(command: str) -> CommandResult:
-    """Ejecuta un comando sin shell, con timeout y ``workspace/`` como cwd."""
+    """Ejecuta un comando validado, sin shell y con ``workspace/`` como cwd.
+
+    La validación es una política defensiva; no constituye un sandbox del sistema
+    operativo.
+    """
     try:
         arguments = shlex.split(command)
     except ValueError as error:
@@ -58,7 +38,7 @@ def run_command(command: str) -> CommandResult:
         return _error_result("El comando está vacío.")
 
     try:
-        _validate_command(arguments)
+        validate_command(arguments, WORKSPACE_ROOT)
         WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
         completed_process = subprocess.run(
             arguments,
@@ -75,7 +55,7 @@ def run_command(command: str) -> CommandResult:
             "stdout": completed_process.stdout,
             "stderr": completed_process.stderr,
         }
-    except (PathSecurityError, ValueError) as error:
+    except CommandPolicyError as error:
         return _error_result(str(error))
     except FileNotFoundError:
         return _error_result(f"Comando no encontrado: {arguments[0]}")
