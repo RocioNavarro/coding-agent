@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+from security.command_policy import SENSITIVE_FILE_EXTENSIONS
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = (PROJECT_ROOT / "workspace").resolve()
@@ -44,6 +46,11 @@ def resolve_workspace_path(path: str | Path) -> Path:
 
     if resolved_path.name in FORBIDDEN_NAMES:
         raise PathSecurityError("El acceso a archivos .env no está permitido.")
+
+    if resolved_path.suffix.casefold() in SENSITIVE_FILE_EXTENSIONS:
+        raise PathSecurityError(
+            f"El acceso al archivo sensible '{resolved_path.name}' no está permitido."
+        )
 
     return resolved_path
 

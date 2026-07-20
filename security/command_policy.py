@@ -36,6 +36,7 @@ SENSITIVE_FILE_NAMES = frozenset(
         "secrets.json",
     }
 )
+SENSITIVE_FILE_EXTENSIONS = frozenset({".pem", ".key", ".pfx", ".p12"})
 EVAL_FLAGS: dict[str, frozenset[str]] = {
     "bash": frozenset({"-c"}),
     "dash": frozenset({"-c"}),
@@ -121,6 +122,10 @@ def _validate_argument_paths(
         ) from error
 
     if any(part.casefold() in sensitive_names for part in candidate.parts):
+        raise CommandPolicyError(
+            f"El acceso al archivo sensible '{candidate_text}' no está permitido."
+        )
+    if candidate.suffix.casefold() in SENSITIVE_FILE_EXTENSIONS:
         raise CommandPolicyError(
             f"El acceso al archivo sensible '{candidate_text}' no está permitido."
         )

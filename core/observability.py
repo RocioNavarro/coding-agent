@@ -37,6 +37,37 @@ _CURRENT_CONTEXT: ContextVar[tuple[str | None, str | None, str | None]] = Contex
     "coding_agent_observation_context", default=(None, None, None)
 )
 
+# Tabla estática de referencia pública (USD por millón de tokens: entrada, salida).
+# Puede desactualizarse con el tiempo; por eso sólo se usa para modelos conocidos
+# y nunca se inventa un costo para un modelo ausente de esta tabla.
+_MODEL_PRICING_USD_PER_MILLION_TOKENS: Mapping[str, tuple[float, float]] = {
+    "gpt-4o": (2.50, 10.00),
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4.1": (2.00, 8.00),
+    "gpt-4.1-mini": (0.40, 1.60),
+    "gpt-4.1-nano": (0.10, 0.40),
+    "o1": (15.00, 60.00),
+    "o1-mini": (1.10, 4.40),
+    "o3-mini": (1.10, 4.40),
+}
+
+
+def estimate_cost(
+    model: str | None, input_tokens: int | None, output_tokens: int | None
+) -> float | None:
+    """Estima el costo en USD sólo para modelos con precio público conocido.
+
+    Devuelve ``None`` para cualquier modelo ausente de la tabla: el sistema no
+    inventa costos para modelos que no puede tasar con una fuente pública.
+    """
+    if not model or input_tokens is None or output_tokens is None:
+        return None
+    pricing = _MODEL_PRICING_USD_PER_MILLION_TOKENS.get(model)
+    if pricing is None:
+        return None
+    input_price, output_price = pricing
+    return (input_tokens * input_price + output_tokens * output_price) / 1_000_000
+
 
 @dataclass(frozen=True)
 class ObservabilityEvent:

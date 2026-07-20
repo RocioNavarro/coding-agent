@@ -18,20 +18,53 @@ integrales deterministas. Todavía no reemplaza al bootstrap interactivo de `mai
 
 ## Caso de uso: PrintScript
 
-El caso de evaluación previsto es asistir sobre un checkout de PrintScript situado
-dentro del workspace autorizado. El agente puede utilizarse para:
+El caso de evaluación es **analizar un repositorio real y desconocido para el
+agente**: un checkout externo de PrintScript (Kotlin, build con Gradle: lexer,
+parser, interpreter, formatter, linter, runner, cli), usado como workspace
+autorizado fuera de este repositorio. Corresponde al objetivo "Analizar un
+repositorio desconocido" de la consigna. El agente se usa para:
 
-- relevar módulos, configuración, convenciones y comandos respaldados por archivos;
-- consultar documentación indexada mediante RAG;
-- proponer un cambio localizado y someterlo a aprobación;
-- validar evidencia, alcance y políticas antes de escribir;
-- ejecutar únicamente verificaciones descubiertas o configuradas;
-- presentar archivos modificados, validaciones, fuentes y bloqueos.
+- relevar módulos, estructura, convenciones y dependencias del repositorio;
+- consultar documentación técnica indexada mediante RAG —tanto la especificación
+  del lenguaje PrintScript como documentación oficial de Kotlin, su lenguaje de
+  implementación— para fundamentar sus conclusiones;
+- generar un reporte de arquitectura citando qué es hallazgo del repositorio,
+  qué viene del RAG y qué es inferencia propia.
 
-Este repositorio no incluye PrintScript, credenciales, un perfil específico ni una
-corrida real contra ese proyecto. Los comandos de build o test deben descubrirse en
-el checkout o configurarse explícitamente; no se documenta ninguno como válido sin
-haberlo verificado allí.
+Deliberadamente **no** incluye modificar código ni ejecutar builds/tests de
+PrintScript: es un caso de uso de sólo análisis, más simple y menos dependiente
+de que el entorno de Gradle/Kotlin esté perfectamente configurado en la máquina
+de evaluación. Implementer, Tester y Reviewer siguen implementados y cubiertos
+por los escenarios de `tests/integration/`, pero no forman parte de este caso de
+uso concreto.
+
+### Objetivo concreto y criterio de éxito
+
+Pedirle al agente que explique la arquitectura de PrintScript y la
+responsabilidad de cada módulo (`lexer`, `parser`, `interpreter`, `formatter`,
+`linter`, `runner`, `cli`, `common`), citando tanto la especificación del
+lenguaje (cátedra) como documentación de Kotlin, ambas indexadas por RAG.
+
+*Criterio de éxito*: el resultado debe citar al menos una fuente RAG concreta de
+cada una (no inferencia) y quedar registrado como evidencia reproducible (output
++ trazabilidad de fuentes + traza en Langfuse).
+
+### Estado real de la incorporación (no HTML de marketing, estado verificado)
+
+- `agent.config.yaml` (no versionado, local) apunta el workspace a un checkout externo
+  de PrintScript, en modo sólo lectura (`write: false`, `run_commands: false`).
+- `profiles/printscript.yaml` describe el proyecto y declara como fuentes RAG la
+  especificación del lenguaje (cátedra) y tres páginas oficiales de la documentación
+  de Kotlin, descargadas en vivo (no el README del checkout, que no tenía contenido
+  sustancial).
+- El índice RAG ya fue construido con esas fuentes reales (68 chunks, verificado;
+  incluye un `HtmlDocumentParser` propio para extraer texto limpio de las páginas
+  de Kotlin sin ruido de HTML).
+- Existe un script de composición (`run_agent.py`) que arma `MainAgent` con Explorer
+  y Researcher reales desde `agent.config.yaml` — validado end-to-end contra la API
+  real de OpenAI (llegó a llamarla; falló sólo por cuota agotada de la cuenta usada
+  para probar, no por un error del código). Es todo lo que este caso de uso necesita:
+  no se conectan Implementer/Tester/Reviewer.
 
 ## Requisitos
 

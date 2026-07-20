@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from agents.researcher import EvidenceFragment, ProjectMemoryProvider
+from core.research_ports import EvidenceFragment, ProjectMemoryProvider
 from core.task_state import TaskState
 from core.observability import NoOpObservabilityClient, ObservabilityClient, ObservabilityEvent, emit_observation
 

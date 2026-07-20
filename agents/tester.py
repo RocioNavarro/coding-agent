@@ -307,42 +307,43 @@ class TesterAgent(BaseAgent):
         context: AgentContext | None = None,
         available_tools: ToolRegistry | None = None,
     ) -> TesterResult:
-        modified = task_state.files_modified
-        if not modified:
-            return self._finish(
-                task_state, "skipped", (), modified,
-                "No hay archivos modificados que validar.", instruction
+        with self._error_guard(task_state, action="validar"):
+            modified = task_state.files_modified
+            if not modified:
+                return self._finish(
+                    task_state, "skipped", (), modified,
+                    "No hay archivos modificados que validar.", instruction
+                )
+            discovered = tuple(
+                command
+                for provider in self.providers
+                for command in provider.get_commands(task_state, modified)
             )
-        discovered = tuple(
-            command
-            for provider in self.providers
-            for command in provider.get_commands(task_state, modified)
-        )
-        candidates = (*discovered, *self._profile_commands(discovered, task_state))
-        selected = self.select_commands(candidates, modified)
-        if not selected:
-            return self._finish(
-                task_state, "unavailable", (), modified,
-                "No se encontraron comandos de validación respaldados por evidencia.",
-                instruction,
-            )
+            candidates = (*discovered, *self._profile_commands(discovered, task_state))
+            selected = self.select_commands(candidates, modified)
+            if not selected:
+                return self._finish(
+                    task_state, "unavailable", (), modified,
+                    "No se encontraron comandos de validación respaldados por evidencia.",
+                    instruction,
+                )
 
-        executions = tuple(
-            self._execute(command, task_state, index)
-            for index, command in enumerate(selected, 1)
-        )
-        records = tuple(record for record, _ in executions)
-        progress = tuple(
-            assessment
-            for _, assessments in executions
-            for assessment in assessments
-        )
-        status = self._overall_status(records)
-        summary = self._summary(status, records)
-        return self._finish(
-            task_state, status, records, modified, summary, instruction,
-            progress_assessments=progress,
-        )
+            executions = tuple(
+                self._execute(command, task_state, index)
+                for index, command in enumerate(selected, 1)
+            )
+            records = tuple(record for record, _ in executions)
+            progress = tuple(
+                assessment
+                for _, assessments in executions
+                for assessment in assessments
+            )
+            status = self._overall_status(records)
+            summary = self._summary(status, records)
+            return self._finish(
+                task_state, status, records, modified, summary, instruction,
+                progress_assessments=progress,
+            )
 
     def _profile_commands(
         self, discovered: Sequence[ValidationCommand], state: TaskState

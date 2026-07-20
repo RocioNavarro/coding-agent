@@ -1,0 +1,51 @@
+name: PrintScript
+description: >
+  Intérprete de PrintScript en Kotlin (lexer, parser, interpreter, linter,
+  formatter, runner, cli) construido con Gradle. Caso de uso del TP Final.
+expected_technologies:
+  - kotlin
+  - gradle
+rag_sources:
+  - name: printscript-language-spec
+    loader: local
+    source_type: documentation
+    path: docs/printscript-language-spec.md
+    tags:
+      - documentation
+      - language-spec
+  - name: kotlin-basic-syntax
+    loader: url
+    source_type: documentation
+    url: https://kotlinlang.org/docs/basic-syntax.html
+    parser: html
+    tags:
+      - documentation
+      - kotlin
+  - name: kotlin-null-safety
+    loader: url
+    source_type: documentation
+    url: https://kotlinlang.org/docs/null-safety.html
+    parser: html
+    tags:
+      - documentation
+      - kotlin
+  - name: kotlin-sealed-classes
+    loader: url
+    source_type: documentation
+    url: https://kotlinlang.org/docs/sealed-classes.html
+    parser: html
+    tags:
+      - documentation
+      - kotlin
+important_files:
+  - docs/printscript-language-spec.md
+  - build.gradle.kts
+  - settings.gradle.kts
+search_tags:
+  - printscript
+  - kotlin
+additional_policies:
+  protected_paths:
+    - build/**
+    - .gradle/**
+    - .kotlin/**

@@ -7,7 +7,12 @@ from collections.abc import Sequence
 
 from rag.embeddings import HashEmbeddingProvider
 from rag.index_manager import IndexManager, IndexingResult
-from rag.processing import ConfigurableChunker, SectionDocumentParser, WhitespaceNormalizer
+from rag.processing import (
+    ConfigurableChunker,
+    HtmlDocumentParser,
+    SectionDocumentParser,
+    WhitespaceNormalizer,
+)
 from rag.sources import ConfiguredSourceLoader, SourceManifest
 from rag.vector_store import JsonVectorStore
 
@@ -24,6 +29,7 @@ def index_manifest(path: str, *, prune: bool = False) -> IndexingResult:
         parsers={
             "sections": SectionDocumentParser(),
             "plain": SectionDocumentParser(),
+            "html": HtmlDocumentParser(),
         },
         normalizer=WhitespaceNormalizer(),
         chunker=ConfigurableChunker(

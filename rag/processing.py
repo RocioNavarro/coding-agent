@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
+from html.parser import HTMLParser
 from pathlib import Path
 from rag.models import ChunkDraft, DocumentSection, ParsedDocument, RawDocument
 
@@ -42,6 +43,69 @@ class SectionDocumentParser(DocumentParser):
             sections.append(DocumentSection(current_title, "\n".join(current_lines)))
         resolved_title = title or Path(document.path_or_url).name or document.source.name
         return ParsedDocument(document, resolved_title, tuple(sections))
+
+
+class _HtmlTextExtractor(HTMLParser):
+    """Agrupa el texto de un HTML en secciones delimitadas por <h1>-<h6>."""
+
+    _HEADING_TAGS = frozenset({"h1", "h2", "h3", "h4", "h5", "h6"})
+    _SKIP_TAGS = frozenset({"script", "style"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.sections: list[DocumentSection] = []
+        self._title = "document"
+        self._buffer: list[str] = []
+        self._skip_depth = 0
+        self._in_heading = False
+        self._heading_buffer: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self._SKIP_TAGS:
+            self._skip_depth += 1
+        elif tag in self._HEADING_TAGS:
+            self._flush_section()
+            self._in_heading = True
+            self._heading_buffer = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._SKIP_TAGS and self._skip_depth > 0:
+            self._skip_depth -= 1
+        elif tag in self._HEADING_TAGS and self._in_heading:
+            self._title = "".join(self._heading_buffer).strip() or self._title
+            self._in_heading = False
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
+        (self._heading_buffer if self._in_heading else self._buffer).append(data)
+
+    def _flush_section(self) -> None:
+        content = "".join(self._buffer).strip()
+        if content:
+            self.sections.append(DocumentSection(self._title, content))
+        self._buffer = []
+
+    def close(self) -> None:
+        super().close()
+        self._flush_section()
+
+
+class HtmlDocumentParser(DocumentParser):
+    """Extrae texto plano de HTML, sin scripts/estilos, agrupado por encabezados."""
+
+    def parse(self, document: RawDocument) -> ParsedDocument:
+        extractor = _HtmlTextExtractor()
+        extractor.feed(document.content)
+        extractor.close()
+        sections = tuple(extractor.sections) or (DocumentSection("document", ""),)
+        resolved_title = (
+            document.source.title
+            or sections[0].title
+            or Path(document.path_or_url).name
+            or document.source.name
+        )
+        return ParsedDocument(document, resolved_title, sections)
 
 
 class TextNormalizer(ABC):

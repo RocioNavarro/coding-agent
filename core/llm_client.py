@@ -12,6 +12,7 @@ from openai import OpenAI, OpenAIError
 from core.models import LLMResponse, LLMUsage, Message, ToolCall
 from core.observability import (
     NoOpObservabilityClient, ObservabilityClient, ObservabilityEvent, emit_observation,
+    estimate_cost,
 )
 
 
@@ -274,7 +275,9 @@ class ObservedLLMClient:
                 output_tokens=response.usage.output_tokens,
                 total_tokens=response.usage.total_tokens,
                 latency_ms=response.latency_ms,
-                estimated_cost=None,
+                estimated_cost=estimate_cost(
+                    response.model, response.usage.input_tokens, response.usage.output_tokens
+                ),
             ),
         )
         self._usage = LLMUsage(

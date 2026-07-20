@@ -10,10 +10,30 @@ from typing import Any, Literal, Mapping, Sequence
 
 from agents.base import AgentContext, AgentExecutionError, AgentInput, BaseAgent
 from core.llm_client import LLMClient
+from core.research_ports import (
+    EvidenceFragment,
+    KnowledgeRetriever,
+    ProjectMemoryProvider,
+    WebSearchProvider,
+)
 from core.settings import AgentSettings
-from core.task_state import ErrorRecord, SourceOrigin, SourceReference, SubagentResult, TaskState
+from core.task_state import SourceOrigin, SourceReference, SubagentResult, TaskState
 from core.profiles import ProjectProfile
 from tools.registry import ToolRegistry
+
+__all__ = [
+    "EvidenceFragment",
+    "KnowledgeRetriever",
+    "ProjectMemoryProvider",
+    "WebSearchProvider",
+    "EvidenceSufficiencyEvaluator",
+    "ThresholdSufficiencyEvaluator",
+    "ProviderName",
+    "ResearchQuery",
+    "SufficiencyAssessment",
+    "ResearcherResult",
+    "ResearcherAgent",
+]
 
 
 RESEARCHER_SYSTEM_PROMPT = """Sos Researcher, un investigador técnico genérico.
@@ -25,41 +45,6 @@ pipeline en el orden memoria, RAG y web sólo como fallback."""
 
 
 ProviderName = Literal["project_memory", "rag", "web"]
-
-
-@dataclass(frozen=True)
-class EvidenceFragment:
-    """Fragmento técnico recuperado con origen, referencia y relevancia."""
-
-    origin: SourceOrigin
-    reference: str
-    content: str
-    relevance: float = 1.0
-
-    def __post_init__(self) -> None:
-        for field_name in ("reference", "content"):
-            value = getattr(self, field_name)
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"{field_name} no puede estar vacío.")
-            object.__setattr__(self, field_name, value.strip())
-        if (
-            isinstance(self.relevance, bool)
-            or not isinstance(self.relevance, (int, float))
-            or not 0 <= self.relevance <= 1
-        ):
-            raise ValueError("relevance debe estar entre 0 y 1.")
-        object.__setattr__(self, "relevance", float(self.relevance))
-
-    def to_source(self) -> SourceReference:
-        return SourceReference(self.origin, self.reference, self.content[:300])
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "origin": self.origin,
-            "reference": self.reference,
-            "content": self.content,
-            "relevance": self.relevance,
-        }
 
 
 @dataclass(frozen=True)
@@ -93,52 +78,6 @@ class SufficiencyAssessment:
             "missing_information",
             tuple(item.strip() for item in self.missing_information),
         )
-
-
-class ProjectMemoryProvider(ABC):
-    @abstractmethod
-    def search(self, query: str, *, limit: int = 5) -> Sequence[EvidenceFragment]:
-        """Recupera decisiones y conocimiento persistido del proyecto."""
-
-
-class KnowledgeRetriever(ABC):
-    @abstractmethod
-    def retrieve(self, query: str, *, limit: int = 5) -> Sequence[EvidenceFragment]:
-        """Recupera fragmentos desde el índice RAG configurado."""
-
-    def retrieve_filtered(
-        self,
-        query: str,
-        *,
-        filters: Mapping[str, str | Sequence[str]] | None = None,
-        limit: int = 5,
-    ) -> Sequence[EvidenceFragment]:
-        """Compatibilidad para proveedores sin soporte de filtros dinámicos."""
-        return self.retrieve(query, limit=limit)
-
-    def retrieval_audit(self) -> Mapping[str, Any] | None:
-        """Devuelve la última traza cuando el proveedor la soporta."""
-        return None
-
-
-class WebSearchProvider(ABC):
-    @abstractmethod
-    def search(self, query: str, *, limit: int = 5) -> Sequence[EvidenceFragment]:
-        """Busca evidencia externa únicamente cuando memoria y RAG no alcanzan."""
-
-    def search_context(
-        self,
-        query: str,
-        *,
-        limit: int = 5,
-        technologies: Sequence[str] = (),
-        rag_metadata: Sequence[Mapping[str, Any]] = (),
-    ) -> Sequence[EvidenceFragment]:
-        """Compatibilidad para proveedores sin priorización contextual."""
-        return self.search(query, limit=limit)
-
-    def search_audit(self) -> Mapping[str, Any] | None:
-        return None
 
 
 class EvidenceSufficiencyEvaluator(ABC):
@@ -257,7 +196,7 @@ class ResearcherAgent(BaseAgent):
         queries: list[ResearchQuery] = []
         rag_audit: Mapping[str, Any] | None = None
         web_audit: Mapping[str, Any] | None = None
-        try:
+        with self._error_guard(task_state, action="investigar"):
             query = self.build_research_query(instruction, task_state, context)
 
             queries.append(ResearchQuery("project_memory", query))
@@ -326,21 +265,6 @@ class ResearcherAgent(BaseAgent):
                 final_assessment,
                 missing,
             )
-        except Exception as error:
-            controlled = error if isinstance(error, AgentExecutionError) else AgentExecutionError(
-                f"El agente '{self.name}' no pudo investigar: {error}"
-            )
-            task_state.record_error(
-                ErrorRecord(
-                    message=str(controlled),
-                    phase=task_state.current_phase,
-                    component=self.name,
-                    recoverable=True,
-                )
-            )
-            if controlled is error:
-                raise
-            raise controlled from error
 
         sources = tuple(fragment.to_source() for fragment in fragments)
         for source in sources:

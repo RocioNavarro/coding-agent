@@ -12,7 +12,7 @@ from typing import Literal, Mapping, Sequence
 from agents.base import AgentContext, AgentExecutionError, AgentInput, BaseAgent
 from agents.context_manager import ContextManager, StateContextManager
 from core.llm_client import LLMClient
-from core.task_state import ErrorRecord, SourceReference, SubagentResult, TaskState
+from core.task_state import SubagentResult, TaskState
 from core.models import EvidenceAssessment
 from security.evidence_policy import EvidenceContext, EvidenceSufficiencyPolicy
 from tools.registry import ToolRegistry
@@ -183,7 +183,7 @@ class ImplementerAgent(BaseAgent):
     ) -> ImplementerResult:
         if mode not in {"propose_only", "apply_changes"}:
             raise ValueError("mode debe ser propose_only o apply_changes.")
-        try:
+        with self._error_guard(task_state, action="implementar"):
             self._verify_preconditions(task_state, mode)
             selected = self.context_manager.select(instruction, task_state, context)
             if not selected.files:
@@ -210,16 +210,6 @@ class ImplementerAgent(BaseAgent):
             subagent_result = self._to_subagent_result(
                 instruction, parsed, changes, modified
             )
-        except Exception as error:
-            controlled = error if isinstance(error, AgentExecutionError) else AgentExecutionError(
-                f"El agente '{self.name}' no pudo implementar: {error}"
-            )
-            task_state.record_error(
-                ErrorRecord(str(controlled), task_state.current_phase, self.name, True)
-            )
-            if controlled is error:
-                raise
-            raise controlled from error
 
         task_state.add_subagent_result(subagent_result)
         task_state.add_observation(

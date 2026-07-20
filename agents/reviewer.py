@@ -156,42 +156,43 @@ class ReviewerAgent(BaseAgent):
         context: AgentContext | None = None,
         available_tools: ToolRegistry | None = None,
     ) -> ReviewerResult:
-        modified = task_state.files_modified
-        diff = self.diff_provider.get_diff(modified)
-        prerequisite = self._prerequisite_issue(task_state, diff)
-        if prerequisite is not None:
-            return self._finish_without_llm(
-                task_state, instruction, diff, prerequisite
-            )
+        with self._error_guard(task_state, action="revisar"):
+            modified = task_state.files_modified
+            diff = self.diff_provider.get_diff(modified)
+            prerequisite = self._prerequisite_issue(task_state, diff)
+            if prerequisite is not None:
+                return self._finish_without_llm(
+                    task_state, instruction, diff, prerequisite
+                )
 
-        deterministic = self._deterministic_issues(task_state, diff)
-        response = self.llm_client.complete(
-            self._build_review_context(instruction, task_state, context, diff), ()
-        )
-        if response.tool_calls:
-            raise AgentExecutionError("Reviewer no puede solicitar tools.")
-        parsed = self._parse_response(response.text)
-        issues = tuple((*deterministic, *parsed["issues"]))
-        decision = self._enforce_decision(parsed["decision"], issues, task_state)
-        required = tuple(
-            dict.fromkeys(
-                (*parsed["required_changes"], *(issue.message for issue in deterministic))
+            deterministic = self._deterministic_issues(task_state, diff)
+            response = self.llm_client.complete(
+                self._build_review_context(instruction, task_state, context, diff), ()
             )
-        )
-        severity = self._max_severity(issues, parsed["severity"])
-        summary = parsed["summary"]
-        return self._finish(
-            task_state,
-            instruction,
-            diff,
-            decision,
-            summary,
-            issues,
-            severity,
-            required,
-            parsed["optional_suggestions"],
-            parsed["confidence"],
-        )
+            if response.tool_calls:
+                raise AgentExecutionError("Reviewer no puede solicitar tools.")
+            parsed = self._parse_response(response.text)
+            issues = tuple((*deterministic, *parsed["issues"]))
+            decision = self._enforce_decision(parsed["decision"], issues, task_state)
+            required = tuple(
+                dict.fromkeys(
+                    (*parsed["required_changes"], *(issue.message for issue in deterministic))
+                )
+            )
+            severity = self._max_severity(issues, parsed["severity"])
+            summary = parsed["summary"]
+            return self._finish(
+                task_state,
+                instruction,
+                diff,
+                decision,
+                summary,
+                issues,
+                severity,
+                required,
+                parsed["optional_suggestions"],
+                parsed["confidence"],
+            )
 
     @staticmethod
     def _prerequisite_issue(

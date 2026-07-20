@@ -7,7 +7,6 @@ from pathlib import Path
 from types import MappingProxyType
 from collections.abc import Iterator
 from typing import Any, Mapping
-from urllib.parse import urlsplit
 
 import yaml
 
@@ -15,6 +14,7 @@ from rag.models import SourceConfig
 from core.profiles import (
     ProfileLoader, ProjectProfile, merge_profile_config, profile_to_config,
 )
+from core.validation import normalize_domain
 
 
 class AgentConfigError(ValueError):
@@ -65,13 +65,10 @@ def _strings(value: object, field: str) -> tuple[str, ...]:
 
 def _domain(value: object, field: str) -> str:
     text = _text(value, field) or ""
-    candidate = text.casefold()
-    if "://" in candidate:
-        candidate = urlsplit(candidate).hostname or ""
-    candidate = candidate.removeprefix("www.").strip(".")
-    if not candidate or "/" in candidate or " " in candidate:
-        raise AgentConfigError(f"{field} contiene un dominio inválido: {text!r}.")
-    return candidate
+    try:
+        return normalize_domain(text)
+    except ValueError:
+        raise AgentConfigError(f"{field} contiene un dominio inválido: {text!r}.") from None
 
 
 def _domains(value: object, field: str) -> tuple[str, ...]:

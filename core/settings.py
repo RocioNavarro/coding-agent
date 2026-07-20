@@ -6,10 +6,9 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from core.config import AgentConfig
+from core.config import AgentConfig, load_agent_config
 
 
 @dataclass
@@ -39,7 +38,6 @@ class AgentSettings:
             raise ValueError("CODING_AGENT_WEB_SEARCH_CONFIG debe ser un objeto JSON.")
         configured_path = os.getenv("CODING_AGENT_CONFIG")
         default_path = Path("agent.config.yaml")
-        from core.config import load_agent_config
 
         agent_config = (
             load_agent_config(configured_path)

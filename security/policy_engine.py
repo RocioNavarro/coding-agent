@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING, Any, Literal, Mapping
 
 from core.settings import AgentSettings
 from core.profiles import ProjectProfile
-from security.command_policy import CommandPolicyError, SENSITIVE_FILE_NAMES, validate_command
+from security.command_policy import (
+    CommandPolicyError,
+    SENSITIVE_FILE_EXTENSIONS,
+    SENSITIVE_FILE_NAMES,
+    validate_command,
+)
 
 if TYPE_CHECKING:
     from core.config import AgentConfig
@@ -202,6 +207,8 @@ class PolicyEngine:
                 or "credential" in part.casefold()
                 for part in candidate.parts
             ):
+                return f"El acceso al archivo sensible '{raw}' no está permitido."
+            if candidate.suffix.casefold() in SENSITIVE_FILE_EXTENSIONS:
                 return f"El acceso al archivo sensible '{raw}' no está permitido."
         return None
 

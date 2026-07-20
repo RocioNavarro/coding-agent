@@ -5,13 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Mapping
-from urllib.parse import urlsplit
+from typing import Any, Mapping
 
 import yaml
 
-if TYPE_CHECKING:
-    from rag.models import SourceConfig
+from core.validation import normalize_domain
+from rag.models import SourceConfig
 
 
 class ProjectProfileError(ValueError):
@@ -35,13 +34,10 @@ def _strings(value: object, field: str) -> tuple[str, ...]:
 
 
 def _domain(value: str, field: str) -> str:
-    candidate = value.casefold()
-    if "://" in candidate:
-        candidate = urlsplit(candidate).hostname or ""
-    candidate = candidate.removeprefix("www.").strip(".")
-    if not candidate or "/" in candidate or " " in candidate:
-        raise ProjectProfileError(f"{field} contiene un dominio inválido: {value!r}.")
-    return candidate
+    try:
+        return normalize_domain(value)
+    except ValueError:
+        raise ProjectProfileError(f"{field} contiene un dominio inválido: {value!r}.") from None
 
 
 def _freeze(value: Any, field: str) -> Any:
@@ -84,8 +80,6 @@ class ProjectProfile:
             object.__setattr__(
                 self, field, tuple(_text(item, field) or "" for item in raw)
             )
-        from rag.models import SourceConfig
-
         if not isinstance(self.rag_sources, (list, tuple)) or not all(
             isinstance(item, SourceConfig) for item in self.rag_sources
         ):
@@ -171,8 +165,6 @@ class ProfileLoader:
         return dict(value)
 
     def _sources(self, value: object) -> tuple["SourceConfig", ...]:
-        from rag.models import SourceConfig
-
         if value is None:
             return ()
         if not isinstance(value, list):

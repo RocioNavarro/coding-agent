@@ -7,7 +7,7 @@ from time import perf_counter
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from agents.researcher import EvidenceFragment, KnowledgeRetriever
+from core.research_ports import EvidenceFragment, KnowledgeRetriever
 from rag.embeddings import EmbeddingProvider
 from rag.models import ChunkMetadata, DocumentChunk
 from rag.vector_store import VectorStore

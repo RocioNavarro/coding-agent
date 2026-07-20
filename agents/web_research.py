@@ -7,22 +7,14 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 from time import perf_counter
 
-from agents.researcher import EvidenceFragment, WebSearchProvider
+from core.research_ports import EvidenceFragment, WebSearchProvider
+from core.validation import normalize_domain
 from tools.web_tools import WebSearchResult, web_search
 from core.observability import NoOpObservabilityClient, ObservabilityClient, ObservabilityEvent, emit_observation
 
 
 SearchBackend = Callable[[str, int], Sequence[WebSearchResult]]
-
-
-def _domain(value: str) -> str:
-    candidate = value.strip().casefold()
-    if "://" in candidate:
-        candidate = urlsplit(candidate).hostname or ""
-    candidate = candidate.removeprefix("www.").strip(".")
-    if not candidate or "/" in candidate or " " in candidate:
-        raise ValueError(f"Dominio inválido: {value!r}")
-    return candidate
+_domain = normalize_domain
 
 
 @dataclass(frozen=True)

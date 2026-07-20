@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from core.llm_client import LLMClient
 from core.models import LLMResponse, Message, ToolCall
@@ -108,6 +109,38 @@ class BaseAgent(ABC):
     def specialization_prompt(self) -> str:
         """Devuelve instrucciones adicionales propias del tipo concreto de agente."""
 
+    @contextmanager
+    def _error_guard(
+        self, task_state: TaskState, *, action: str = "completar la tarea"
+    ) -> Iterator[None]:
+        """Convierte fallas no controladas en AgentExecutionError y las registra.
+
+        Todo subagente debe envolver su lógica de ``run`` con este context manager,
+        para que un fallo (propio o de este agente) siempre quede auditado en
+        ``task_state.errors`` antes de propagarse, sin excepciones sin registrar
+        entre distintos subagentes.
+        """
+        try:
+            yield
+        except Exception as error:
+            if isinstance(error, AgentExecutionError):
+                controlled_error = error
+            else:
+                controlled_error = AgentExecutionError(
+                    f"El agente '{self.name}' no pudo {action}: {error}"
+                )
+            task_state.record_error(
+                ErrorRecord(
+                    message=str(controlled_error),
+                    phase=task_state.current_phase,
+                    component=self.name,
+                    recoverable=True,
+                )
+            )
+            if controlled_error is error:
+                raise
+            raise controlled_error from error
+
     def run(
         self,
         instruction: str,
@@ -125,31 +158,13 @@ class BaseAgent(ABC):
         )
         tools = available_tools or ToolRegistry()
 
-        try:
+        with self._error_guard(task_state):
             schemas = self._allowed_schemas(tools)
             response = self.llm_client.complete(
                 self.build_context(agent_input), schemas
             )
             self.validate_tool_calls(response.tool_calls, tools)
             result = self.to_subagent_result(agent_input, response)
-        except Exception as error:
-            if isinstance(error, AgentExecutionError):
-                controlled_error = error
-            else:
-                controlled_error = AgentExecutionError(
-                    f"El agente '{self.name}' no pudo completar la tarea: {error}"
-                )
-            task_state.record_error(
-                ErrorRecord(
-                    message=str(controlled_error),
-                    phase=task_state.current_phase,
-                    component=self.name,
-                    recoverable=True,
-                )
-            )
-            if controlled_error is error:
-                raise
-            raise controlled_error from error
 
         task_state.add_subagent_result(result)
         for source in result.sources:
