@@ -204,6 +204,30 @@ def test_detects_maven_as_a_different_build_system(maven_repository: Path) -> No
     assert "src/main/java/com/example/Main.java" in report.inventory.entry_points
 
 
+def test_gradle_settings_are_authoritative_for_modules(tmp_path: Path) -> None:
+    root = tmp_path / "gradle-project"
+    write(
+        root / "settings.gradle.kts",
+        'rootProject.name = "Demo"\ninclude("api", "core", "runner")\ninclude("runner")\n',
+    )
+    write(root / "api/build.gradle", "plugins {}")
+    write(root / "core/build.gradle", "plugins {}")
+    write(root / "runner/build.gradle", "plugins {}")
+    write(root / "buildSrc/build.gradle.kts", "plugins {}")
+    write(root / "docs/README.md", "# Docs")
+
+    report = ExplorerAgent(
+        repository_root=root, llm_client=FakeExplorerLLM()
+    ).explore("Arquitectura")
+
+    assert report.declared_modules == ("api", "core", "runner")
+    assert report.build_infrastructure == ("buildSrc",)
+    assert "buildSrc" not in report.declared_modules
+    assert report.module_warnings == (
+        "El módulo 'runner' aparece repetido en settings.gradle.kts.",
+    )
+
+
 def registry_with_write() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(

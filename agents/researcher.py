@@ -194,7 +194,7 @@ class ResearcherAgent(BaseAgent):
         if not isinstance(task_state, TaskState):
             raise TypeError("task_state debe ser una instancia de TaskState.")
         queries: list[ResearchQuery] = []
-        rag_audit: Mapping[str, Any] | None = None
+        rag_audits: list[Mapping[str, Any]] = []
         web_audit: Mapping[str, Any] | None = None
         with self._error_guard(task_state, action="investigar"):
             query = self.build_research_query(instruction, task_state, context)
@@ -204,16 +204,29 @@ class ResearcherAgent(BaseAgent):
                 self.project_memory.search(query, limit=5), "project_memory"
             )
 
-            queries.append(ResearchQuery("rag", query))
-            rag = self._validate_fragments(
-                self.knowledge_retriever.retrieve_filtered(
-                    query,
-                    filters=self._build_rag_filters(task_state, context),
-                    limit=5,
-                ),
-                "rag",
+            rag_fragments: list[EvidenceFragment] = []
+            for rag_query in self.build_rag_queries(instruction, task_state):
+                queries.append(ResearchQuery("rag", rag_query))
+                recovered = self._validate_fragments(
+                    self.knowledge_retriever.retrieve_filtered(
+                        rag_query,
+                        filters=self._build_rag_filters(
+                            task_state, context, query=rag_query
+                        ),
+                        limit=3,
+                    ),
+                    "rag",
+                )
+                rag_fragments.extend(recovered)
+                audit = self.knowledge_retriever.retrieval_audit()
+                if audit:
+                    rag_audits.append(audit)
+            rag = tuple(
+                {
+                    (fragment.reference, fragment.content): fragment
+                    for fragment in rag_fragments
+                }.values()
             )
-            rag_audit = self.knowledge_retriever.retrieval_audit()
 
             repository = self._repository_fragments(task_state, context)
             fragments = [*repository, *memory, *rag]
@@ -228,7 +241,11 @@ class ResearcherAgent(BaseAgent):
                         query,
                         limit=5,
                         technologies=self._detected_technologies(task_state),
-                        rag_metadata=self._rag_metadata(rag_audit),
+                        rag_metadata=tuple(
+                            metadata
+                            for audit in rag_audits
+                            for metadata in self._rag_metadata(audit)
+                        ),
                     ),
                     "web",
                 )
@@ -283,7 +300,7 @@ class ResearcherAgent(BaseAgent):
             f"Researcher usó web: {'sí' if web_used else 'no'}; "
             f"confianza: {final_assessment.confidence:.2f}."
         )
-        if rag_audit:
+        for rag_audit in rag_audits:
             task_state.add_observation(
                 "RAG trace: "
                 + json.dumps(self._compact_rag_audit(rag_audit), ensure_ascii=False)
@@ -311,22 +328,8 @@ class ResearcherAgent(BaseAgent):
         task_state: TaskState,
         context: AgentContext | None = None,
     ) -> str:
-        """Combina sólo señales disponibles, con etiquetas neutrales y trazables."""
-        relevant_files = tuple(
-            dict.fromkeys(
-                file
-                for result in task_state.subagent_results
-                for file in result.files_relevant
-            )
-        )
-        repository_sources = tuple(
-            source.reference for source in task_state.sources if source.origin == "repository"
-        )
-        errors = tuple(error.message for error in task_state.errors)
-        parts = [
-            f"Pedido original: {task_state.original_request}",
-            f"Instrucción de investigación: {instruction}",
-        ]
+        """Produce una consulta breve para memoria, sin inventarios ni pedido duplicado."""
+        parts = ["Investigación técnica: " + self._compact_instruction(instruction)]
         confirmed = self._detected_technologies(task_state)
         if confirmed:
             parts.append("Tecnologías confirmadas por Explorer: " + ", ".join(confirmed))
@@ -341,31 +344,47 @@ class ResearcherAgent(BaseAgent):
                 "Tags usados en consultas: " + ", ".join(self.profile.search_tags)
             )
         if self.profile.rag_sources:
-            references = tuple(source.location for source in self.profile.rag_sources)
-            parts.append("Fuentes RAG efectivas configuradas: " + ", ".join(references))
+            references = tuple(source.name for source in self.profile.rag_sources)
             task_state.add_observation(
                 "Fuentes RAG efectivas consideradas: " + ", ".join(references)
             )
-        if task_state.repository_findings:
-            parts.append(
-                "Tecnologías, dependencias y configuración detectadas por Explorer: "
-                + " | ".join(task_state.repository_findings)
-            )
-        if relevant_files:
-            parts.append("Archivos relevantes: " + ", ".join(relevant_files))
-        if repository_sources:
-            parts.append("Evidencia/configuración del repositorio: " + ", ".join(repository_sources))
-        if errors:
-            parts.append("Errores observados: " + " | ".join(errors))
-        if context is not None and context.facts:
-            parts.append("Contexto seleccionado: " + " | ".join(context.facts))
         return "\n".join(parts)
 
+    def build_rag_queries(
+        self, instruction: str, task_state: TaskState
+    ) -> tuple[str, ...]:
+        """Deriva necesidades concretas en queries cortas y trazables."""
+        text = f"{instruction} {task_state.original_request}".casefold()
+        project_name = self.profile.name.strip() if self.profile.name else ""
+        queries: list[str] = []
+        analysis_terms = {"arquitectura", "architecture", "módulo", "modulo", "module"}
+        if project_name and any(term in text for term in analysis_terms):
+            queries.extend(
+                (
+                    f"{project_name} language architecture modules",
+                    f"{project_name} lexer parser interpreter flow",
+                    f"{project_name} language specification",
+                )
+            )
+        technologies = {item.casefold() for item in self._detected_technologies(task_state)}
+        if "kotlin" in technologies and "gradle" in technologies and any(
+            term in text for term in analysis_terms
+        ):
+            queries.append("Kotlin Gradle multi-module architecture")
+        if "sealed" in text:
+            queries.append("Kotlin sealed classes")
+        if "null safety" in text or "nulabilidad" in text:
+            queries.append("Kotlin null safety")
+        if not queries:
+            subject = project_name or "project"
+            queries.append(f"{subject} {self._compact_instruction(instruction, limit=160)}")
+        return tuple(dict.fromkeys(queries))
+
     def _build_rag_filters(
-        self, state: TaskState, context: AgentContext | None
+        self, state: TaskState, context: AgentContext | None, *, query: str | None = None
     ) -> dict[str, tuple[str, ...]]:
         filters: dict[str, list[str]] = {}
-        supported = {"technology", "language", "framework", "source_type", "module", "tags"}
+        supported = {"technology", "language", "framework", "source_type", "module", "tags", "source"}
         for finding in state.repository_findings:
             prefix, separator, remainder = finding.partition("=")
             key = prefix.strip().casefold()
@@ -382,6 +401,16 @@ class ResearcherAgent(BaseAgent):
                 key = key.strip().casefold()
                 if separator and key in supported and value.strip():
                     filters.setdefault(key, []).append(value.strip())
+        if query and self.profile.name and self.profile.name.casefold() in query.casefold():
+            matching_sources = tuple(
+                source.name
+                for source in self.profile.rag_sources
+                if self.profile.name.casefold() in source.name.casefold()
+            )
+            if matching_sources:
+                return {"source": matching_sources}
+        if query and "kotlin" in query.casefold():
+            return {"tags": ("kotlin",)}
         if self.profile.search_tags:
             filters.setdefault("tags", []).extend(self.profile.search_tags)
         return {key: tuple(dict.fromkeys(values)) for key, values in filters.items()}
@@ -396,7 +425,10 @@ class ResearcherAgent(BaseAgent):
                     "chunk_id": item.get("chunk_id"),
                     "score": item.get("score"),
                     "document_id": item.get("metadata", {}).get("document_id"),
+                    "source_name": item.get("metadata", {}).get("source_name"),
                     "path_or_url": item.get("metadata", {}).get("path_or_url"),
+                    "section": item.get("metadata", {}).get("section"),
+                    "tags": item.get("metadata", {}).get("tags", []),
                 }
                 for item in items
                 if isinstance(item, dict)
@@ -407,6 +439,7 @@ class ResearcherAgent(BaseAgent):
             "filters": audit.get("filters", {}),
             "retrieved": summarize(audit.get("retrieved_chunks")),
             "used": summarize(audit.get("used_chunks")),
+            "discarded": summarize(audit.get("discarded_chunks")),
             "scores": audit.get("scores", {}),
             "documents": audit.get("documents", []),
             "conclusions": audit.get("conclusions", []),
@@ -476,9 +509,16 @@ class ResearcherAgent(BaseAgent):
         assessment: SufficiencyAssessment,
         missing: Sequence[str],
     ) -> SubagentResult:
+        bounded_fragments = [
+            {
+                **item.to_dict(),
+                "content": item.content[:1_200],
+            }
+            for item in fragments[:12]
+        ]
         facts = (
             f"Consultas: {json.dumps([query.__dict__ for query in queries], ensure_ascii=False)}",
-            f"Fragmentos: {json.dumps([item.to_dict() for item in fragments], ensure_ascii=False)}",
+            f"Fragmentos aceptados: {json.dumps(bounded_fragments, ensure_ascii=False)}",
             f"Confianza evaluada: {assessment.confidence}",
             f"Información faltante: {json.dumps(list(missing), ensure_ascii=False)}",
         )
@@ -519,6 +559,11 @@ class ResearcherAgent(BaseAgent):
             blockers=tuple(missing),
             confidence=assessment.confidence,
         )
+
+    @staticmethod
+    def _compact_instruction(value: str, *, limit: int = 240) -> str:
+        text = " ".join(value.split())
+        return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
     @staticmethod
     def _validate_fragments(

@@ -41,6 +41,8 @@ def chunk(
     language: str | None = None,
     tags: tuple[str, ...] = (),
     content_hash: str | None = None,
+    source_name: str | None = None,
+    section: str = "section",
 ) -> DocumentChunk:
     return DocumentChunk(
         chunk_id,
@@ -48,11 +50,11 @@ def chunk(
         vector,
         ChunkMetadata(
             document_id=document_id,
-            source_name=f"source-{document_id}",
+            source_name=source_name or f"source-{document_id}",
             source_type=source_type,
             path_or_url=f"docs/{document_id}.txt",
             title=f"Document {document_id}",
-            section="section",
+            section=section,
             detected_language=language,
             tags=tags,
             chunk_index=0,
@@ -224,3 +226,51 @@ def test_audit_differentiates_retrieved_used_and_inferred_conclusions(tmp_path: 
     assert set(audit["scores"]) == {"a", "b"}
     assert audit["documents"] == ["doc-a"]
     assert audit["conclusions"]
+
+
+def test_low_scores_from_same_source_are_discarded_and_insufficient(
+    tmp_path: Path,
+) -> None:
+    retriever = RagRetriever(
+        embedding_provider=QueryEmbedding({"architecture modules": (1.0, 0.0)}),
+        vector_store=store_with(
+            tmp_path,
+            chunk(
+                "a", "doc-a", "Kotlin variables", (0.38, 0.925),
+                source_name="kotlin-basic-syntax", section="Variables",
+            ),
+            chunk(
+                "b", "doc-b", "More Kotlin variables", (0.32, 0.947),
+                source_name="kotlin-basic-syntax", section="Variables",
+            ),
+        ),
+    )
+
+    trace = retriever.retrieve_context("architecture modules")
+
+    assert len(trace.retrieved_chunks) == 2
+    assert trace.used_chunks == ()
+    assert {item.chunk_id for item in trace.discarded_chunks} == {"a", "b"}
+    assert trace.sufficiency.sufficient is False
+
+
+def test_fragment_preserves_rag_metadata_and_query(tmp_path: Path) -> None:
+    retriever = RagRetriever(
+        embedding_provider=QueryEmbedding({"PrintScript specification": (1.0, 0.0)}),
+        vector_store=store_with(
+            tmp_path,
+            chunk(
+                "spec", "doc-spec", "PrintScript processing architecture", (1.0, 0.0),
+                source_name="printscript-language-spec",
+                section="Architecture",
+                tags=("language-spec",),
+            ),
+        ),
+    )
+
+    fragment = retriever.retrieve("PrintScript specification")[0]
+
+    assert fragment.metadata["source_name"] == "printscript-language-spec"
+    assert fragment.metadata["section"] == "Architecture"
+    assert fragment.metadata["tags"] == ["language-spec"]
+    assert fragment.metadata["query"] == "PrintScript specification"

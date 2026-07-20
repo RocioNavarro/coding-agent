@@ -24,6 +24,7 @@ class EvidenceFragment:
     reference: str
     content: str
     relevance: float = 1.0
+    metadata: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("reference", "content"):
@@ -38,6 +39,10 @@ class EvidenceFragment:
         ):
             raise ValueError("relevance debe estar entre 0 y 1.")
         object.__setattr__(self, "relevance", float(self.relevance))
+        metadata = dict(self.metadata or {})
+        if not all(isinstance(key, str) for key in metadata):
+            raise ValueError("metadata debe usar claves de texto.")
+        object.__setattr__(self, "metadata", metadata)
 
     def to_source(self) -> SourceReference:
         return SourceReference(self.origin, self.reference, self.content[:300])
@@ -48,6 +53,7 @@ class EvidenceFragment:
             "reference": self.reference,
             "content": self.content,
             "relevance": self.relevance,
+            "metadata": dict(self.metadata or {}),
         }
 
 

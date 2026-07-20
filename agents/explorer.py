@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
+import re
 from typing import Mapping, Sequence
 
 from agents.base import AgentContext, BaseAgent
@@ -99,9 +100,25 @@ class ExplorerReport:
     relevant_files: tuple[str, ...]
     architecture_summary: str
     exploration_metrics: Mapping[str, object] = field(default_factory=dict)
+    declared_modules: tuple[str, ...] = ()
+    build_infrastructure: tuple[str, ...] = ()
+    module_warnings: tuple[str, ...] = ()
 
     def facts(self) -> tuple[str, ...]:
         facts = [f"Resumen de arquitectura: {self.architecture_summary}"]
+        if self.declared_modules:
+            facts.append(
+                "Módulos declarados por settings de Gradle: "
+                + ", ".join(self.declared_modules)
+                + ". Evidencia: settings.gradle/settings.gradle.kts."
+            )
+        if self.build_infrastructure:
+            facts.append(
+                "Infraestructura auxiliar de build (no subproyectos declarados): "
+                + ", ".join(self.build_infrastructure)
+                + "."
+            )
+        facts.extend(f"Advertencia de módulos: {item}" for item in self.module_warnings)
         artifact_groups = (
             ("configuración", self.inventory.configuration_files),
             ("documentación", self.inventory.documentation_files),
@@ -205,6 +222,9 @@ class ExplorerAgent(BaseAgent):
 
     def explore(self, instruction: str) -> ExplorerReport:
         inventory, contents, metrics = self._scan()
+        modules, build_infrastructure, module_warnings = self._gradle_modules(
+            inventory, contents
+        )
         snapshot = RepositorySnapshot(
             files=inventory.files,
             directories=inventory.directories,
@@ -227,6 +247,9 @@ class ExplorerAgent(BaseAgent):
             relevant_files=relevant,
             architecture_summary=summary,
             exploration_metrics=metrics,
+            declared_modules=modules,
+            build_infrastructure=build_infrastructure,
+            module_warnings=module_warnings,
         )
 
     def _scan(self) -> tuple[RepositoryInventory, dict[str, str], dict[str, object]]:
@@ -505,6 +528,18 @@ class ExplorerAgent(BaseAgent):
 
     def _record_report(self, report: ExplorerReport, state: TaskState) -> None:
         state.add_repository_finding(f"Arquitectura: {report.architecture_summary}")
+        if report.declared_modules:
+            state.add_repository_finding(
+                "modules=" + ", ".join(report.declared_modules)
+                + "; evidencia: settings.gradle/settings.gradle.kts."
+            )
+        if report.build_infrastructure:
+            state.add_repository_finding(
+                "build_infrastructure=" + ", ".join(report.build_infrastructure)
+                + "; no son subproyectos declarados."
+            )
+        for warning in report.module_warnings:
+            state.add_repository_finding(f"module_warning={warning}")
         artifact_groups = (
             ("configuración", report.inventory.configuration_files),
             ("documentación", report.inventory.documentation_files),
@@ -544,9 +579,13 @@ class ExplorerAgent(BaseAgent):
             return
         self.project_memory.update_project_summary(report.architecture_summary)
         self.project_memory.update_architecture(report.architecture_summary)
-        for directory in report.inventory.directories:
-            if "/" not in directory:
-                self.project_memory.add_module(directory)
+        modules = report.declared_modules or tuple(
+            directory
+            for directory in report.inventory.directories
+            if "/" not in directory and directory not in {"buildSrc", "docs", ".github"}
+        )
+        for module in modules:
+            self.project_memory.add_module(module)
         for path in report.relevant_files:
             self.project_memory.add_important_file(path)
         for detection in report.detections:
@@ -608,6 +647,47 @@ class ExplorerAgent(BaseAgent):
             or lowered.startswith(".circleci/")
             or Path(path).name.casefold() in {".gitlab-ci.yml", "jenkinsfile", "azure-pipelines.yml"}
         )
+
+    def _gradle_modules(
+        self,
+        inventory: RepositoryInventory,
+        contents: Mapping[str, str],
+    ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+        """Usa settings.gradle como autoridad y separa infraestructura auxiliar."""
+        settings_path = next(
+            (path for path in ("settings.gradle.kts", "settings.gradle") if path in inventory.files),
+            None,
+        )
+        modules: list[str] = []
+        warnings: list[str] = []
+        if settings_path is not None:
+            content = contents.get(settings_path)
+            if content is None:
+                try:
+                    candidate = self.repository_root / settings_path
+                    if candidate.stat().st_size <= MAX_SELECTED_FILE_BYTES:
+                        content = candidate.read_text(encoding="utf-8")
+                except (OSError, UnicodeError):
+                    content = None
+            if content:
+                declared = [
+                    name.lstrip(":")
+                    for block in re.findall(r"\binclude\s*\((.*?)\)", content, re.DOTALL)
+                    for name in re.findall(r"['\"]([^'\"]+)['\"]", block)
+                ]
+                modules = list(dict.fromkeys(declared))
+                duplicates = sorted(
+                    name for name in set(declared) if declared.count(name) > 1
+                )
+                warnings.extend(
+                    f"El módulo '{name}' aparece repetido en {settings_path}."
+                    for name in duplicates
+                )
+        infrastructure = ("buildSrc",) if any(
+            path == "buildSrc" or path.startswith("buildSrc/")
+            for path in inventory.directories
+        ) else ()
+        return tuple(modules), infrastructure, tuple(warnings)
 
 
 def build_explorer_registry(repository_root: str | Path) -> ToolRegistry:

@@ -330,15 +330,14 @@ def test_query_adapts_to_explorer_technologies_files_errors_and_configuration() 
     researcher.run("Buscar guía de compatibilidad", state)
 
     query = memory.queries[0]
-    assert rag.queries == [query]
-    assert "Corregir manejo de errores" in query
+    assert len(rag.queries) == 1
+    assert len(query) < 500
+    assert "Buscar guía de compatibilidad" in query
     assert "Python" in query
     assert "FastAPI" in query
-    assert "httpx" in query
-    assert "src/service.py" in query
-    assert "tests/test_service.py" in query
-    assert "AssertionError en test_error" in query
-    assert "pyproject.toml" in query
+    assert "src/service.py" not in query
+    assert "tests/test_service.py" not in query
+    assert "AssertionError en test_error" not in query
     sent_context = json.loads(llm.messages[1].content)["context"]
     assert any("project_memory" in fact for fact in sent_context["facts"])
     assert llm.tools == []
@@ -363,6 +362,9 @@ def test_passes_explorer_filters_and_registers_rag_trace_in_task_state() -> None
     payload = json.loads(trace.removeprefix("RAG trace: "))
     assert payload["retrieved"][0]["chunk_id"] == "chunk-1"
     assert payload["used"][0]["score"] == 0.91
+    assert "source_name" in payload["used"][0]
+    assert "section" in payload["used"][0]
+    assert "tags" in payload["used"][0]
     assert payload["documents"] == ["doc-1"]
     assert payload["conclusions"] == ["Evidencia suficiente."]
 

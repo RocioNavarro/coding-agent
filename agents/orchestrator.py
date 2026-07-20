@@ -175,6 +175,13 @@ class LLMTaskAnalyzer:
 class LLMPlanGenerator:
     """Planificador sin tools que recibe evidencia acotada del estado compartido."""
 
+    MAX_RELEVANT_FILES = 20
+    MAX_FINDINGS = 12
+    MAX_SOURCES = 12
+    MAX_UNCERTAINTIES = 8
+    MAX_ITEM_CHARACTERS = 500
+    MAX_CONTEXT_CHARACTERS = 12_000
+
     def __init__(self, llm_client: LLMClient) -> None:
         self.llm_client = llm_client
 
@@ -184,19 +191,7 @@ class LLMPlanGenerator:
         *,
         feedback: Sequence[str] = (),
     ) -> str:
-        evidence = {
-            "request": state.original_request,
-            "repository_findings": list(state.repository_findings),
-            "relevant_files": list(
-                dict.fromkeys(
-                    path
-                    for result in state.subagent_results
-                    for path in result.files_relevant
-                )
-            ),
-            "sources": [source.to_dict() for source in state.sources],
-            "feedback": list(feedback),
-        }
+        evidence = self.build_compact_evidence(state, feedback=feedback)
         messages = [
             Message(
                 "system",
@@ -210,6 +205,121 @@ class LLMPlanGenerator:
         if response.tool_calls or not plan:
             raise AgentExecutionError("El planificador devolvió un plan inválido.")
         return plan
+
+    def build_compact_evidence(
+        self, state: TaskState, *, feedback: Sequence[str] = ()
+    ) -> dict[str, object]:
+        """Selecciona señales útiles sin reenviar inventarios ni chunks completos."""
+        summaries = [
+            self._bounded(result.summary or result.result or "")
+            for result in state.subagent_results
+            if result.summary or result.result
+        ]
+        findings = [
+            self._bounded(item)
+            for item in state.repository_findings
+            if self._useful_finding(item)
+        ][: self.MAX_FINDINGS]
+        modules = self._finding_values(state.repository_findings, "modules=")
+        dependencies = self._finding_values(state.repository_findings, "dependency=")
+        files = list(
+            dict.fromkeys(
+                path
+                for result in state.subagent_results
+                for path in result.files_relevant
+            )
+        )[: self.MAX_RELEVANT_FILES]
+        sources: list[dict[str, object]] = []
+        seen_sources: set[tuple[str, str]] = set()
+        for source in state.sources:
+            key = (source.origin, source.reference)
+            if key in seen_sources:
+                continue
+            seen_sources.add(key)
+            sources.append(
+                {
+                    "origin": source.origin,
+                    "reference": self._bounded(source.reference),
+                    "summary": self._bounded(source.summary or ""),
+                }
+            )
+            if len(sources) >= self.MAX_SOURCES:
+                break
+        uncertainties = list(
+            dict.fromkeys(
+                [*state.warnings, *(error.message for error in state.errors)]
+                + [
+                    blocker
+                    for result in state.subagent_results
+                    for blocker in result.blockers
+                ]
+            )
+        )[: self.MAX_UNCERTAINTIES]
+        evidence: dict[str, object] = {
+            "request": state.original_request,
+            "task_type": self._task_type(state),
+            "agent_summaries": summaries,
+            "confirmed_modules": modules,
+            "main_dependencies": dependencies,
+            "selected_findings": findings,
+            "relevant_files": files,
+            "sources": sources,
+            "uncertainties": [self._bounded(item) for item in uncertainties],
+            "security_constraints": [
+                "Sólo lectura.",
+                "No modificar archivos.",
+                "No ejecutar comandos, builds ni tests.",
+                "No usar búsqueda web.",
+            ],
+            "feedback": [self._bounded(item) for item in feedback],
+        }
+        self._fit_context(evidence)
+        return evidence
+
+    def _fit_context(self, evidence: dict[str, object]) -> None:
+        """Reduce colecciones secundarias hasta respetar el presupuesto total."""
+        shrink_order = ("sources", "selected_findings", "relevant_files", "agent_summaries")
+        while len(json.dumps(evidence, ensure_ascii=False)) > self.MAX_CONTEXT_CHARACTERS:
+            for key in shrink_order:
+                values = evidence[key]
+                if isinstance(values, list) and values:
+                    values.pop()
+                    break
+            else:
+                return
+
+    @classmethod
+    def _bounded(cls, value: str) -> str:
+        text = " ".join(value.split())
+        if len(text) <= cls.MAX_ITEM_CHARACTERS:
+            return text
+        return text[: cls.MAX_ITEM_CHARACTERS - 1].rstrip() + "…"
+
+    @staticmethod
+    def _useful_finding(value: str) -> bool:
+        category = value.split("=", 1)[0].split(":", 1)[0].strip().casefold()
+        return category in {
+            "arquitectura", "modules", "build_infrastructure", "module_warning",
+            "language", "build_system", "framework", "dependency", "entry_points",
+            "configuración", "documentación", "ci",
+        }
+
+    @classmethod
+    def _finding_values(cls, values: Sequence[str], prefix: str) -> list[str]:
+        result: list[str] = []
+        for value in values:
+            if not value.casefold().startswith(prefix.casefold()):
+                continue
+            payload = value[len(prefix):].split(";", 1)[0]
+            result.extend(item.strip() for item in payload.split(",") if item.strip())
+        return list(dict.fromkeys(result))
+
+    @staticmethod
+    def _task_type(state: TaskState) -> str:
+        for observation in state.observations:
+            if observation.startswith("Tarea clasificada como "):
+                return observation.removeprefix("Tarea clasificada como ").split(":", 1)[0]
+        return "unknown"
 
 
 @dataclass(frozen=True)
