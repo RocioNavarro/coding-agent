@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import shlex
+from fnmatch import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import TYPE_CHECKING, Any, Literal, Mapping
 
-from core.config import AgentConfig
 from core.settings import AgentSettings
+from core.profiles import ProjectProfile
 from security.command_policy import CommandPolicyError, SENSITIVE_FILE_NAMES, validate_command
+
+if TYPE_CHECKING:
+    from core.config import AgentConfig
 
 
 PolicyOutcome = Literal["allow", "deny", "require_approval"]
@@ -31,6 +35,7 @@ class PolicyContext:
     permissions: AgentToolPermissions = AgentToolPermissions()
     config: AgentConfig | None = None
     settings: AgentSettings | None = None
+    profile: ProjectProfile | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.agent, str) or not self.agent.strip():
@@ -94,6 +99,11 @@ class PolicyEngine:
             if command_error:
                 return self._decision("deny", command_error, context, name)
 
+        profile_decision = self._profile_policy(name, values, context)
+        if profile_decision is not None:
+            outcome, reason = profile_decision
+            return self._decision(outcome, reason, context, name)
+
         modifies = modifies_system if modifies_system is not None else name in {
             "write_file", "run_command"
         }
@@ -106,6 +116,35 @@ class PolicyEngine:
                 name,
             )
         return self._decision("allow", "La tool call cumple las políticas.", context, name)
+
+    def _profile_policy(
+        self, tool: str, parameters: dict[str, Any], context: PolicyContext
+    ) -> tuple[PolicyOutcome, str] | None:
+        profile = context.profile or (context.config.profile if context.config else None)
+        if profile is None or not profile.additional_policies:
+            return None
+        policies = profile.additional_policies
+        denied_tools = policies.get("denied_tools", ())
+        if isinstance(denied_tools, (list, tuple)) and tool in denied_tools:
+            return "deny", f"El perfil restringe la tool '{tool}'. Origen: project_profile."
+        if tool == "run_command":
+            command = parameters.get("command")
+            denied_commands = policies.get("denied_commands", ())
+            if isinstance(command, str) and isinstance(denied_commands, (list, tuple)):
+                if command in denied_commands:
+                    return "deny", "El perfil restringe este comando. Origen: project_profile."
+        protected = policies.get("protected_paths", ())
+        if isinstance(protected, (list, tuple)):
+            for key, value in parameters.items():
+                if isinstance(value, str) and "path" in key.casefold():
+                    if any(fnmatch(value, str(pattern)) for pattern in protected):
+                        return "deny", "La ruta está protegida por project_profile."
+        approvals = policies.get("require_approval_tools", ())
+        if isinstance(approvals, (list, tuple)) and tool in approvals:
+            return "require_approval", (
+                f"La tool '{tool}' requiere aprobación por project_profile."
+            )
+        return None
 
     def _configuration_policy(
         self, tool: str, parameters: dict[str, Any], context: PolicyContext

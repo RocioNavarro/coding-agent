@@ -13,15 +13,18 @@ from typing import Literal, Sequence
 
 from agents.base import AgentContext, BaseAgent
 from core.llm_client import LLMClient
+from core.profiles import ProjectProfile
+from core.settings import AgentSettings
 from core.task_state import SubagentResult, TaskState, ToolExecutionRecord
 from security.command_policy import CommandPolicyError, validate_command
+from security.policy_engine import PolicyContext, PolicyEngine
 from tools.registry import ToolRegistry
 
 
 ValidationStatus = Literal["passed", "failed", "skipped", "blocked", "unavailable"]
 CommandOrigin = Literal[
     "script", "configuration", "documentation", "project_memory",
-    "agent_configuration", "explorer"
+    "agent_configuration", "explorer", "project_profile"
 ]
 
 
@@ -258,6 +261,9 @@ class TesterAgent(BaseAgent):
         limits: TesterLimits | None = None,
         safety_policy: ValidationSafetyPolicy | None = None,
         name: str = "tester",
+        profile: ProjectProfile | None = None,
+        policy_engine: PolicyEngine | None = None,
+        policy_context: PolicyContext | None = None,
     ) -> None:
         super().__init__(
             name=name,
@@ -270,6 +276,14 @@ class TesterAgent(BaseAgent):
         self.executor = executor or SubprocessValidationExecutor(repository_root)
         self.limits = limits or TesterLimits()
         self.safety_policy = safety_policy or ValidationSafetyPolicy(repository_root)
+        self.profile = profile or ProjectProfile()
+        self.policy_engine = policy_engine or PolicyEngine()
+        self.policy_context = policy_context or PolicyContext(
+            agent=name,
+            workspace=Path(repository_root),
+            settings=AgentSettings(supervision_enabled=False),
+            profile=self.profile,
+        )
 
     def specialization_prompt(self) -> str:
         return "No generes ni ejecutes comandos desde el LLM."
@@ -287,11 +301,12 @@ class TesterAgent(BaseAgent):
                 task_state, "skipped", (), modified,
                 "No hay archivos modificados que validar.", instruction
             )
-        candidates = tuple(
+        discovered = tuple(
             command
             for provider in self.providers
             for command in provider.get_commands(task_state, modified)
         )
+        candidates = (*discovered, *self._profile_commands(discovered, task_state))
         selected = self.select_commands(candidates, modified)
         if not selected:
             return self._finish(
@@ -304,6 +319,37 @@ class TesterAgent(BaseAgent):
         status = self._overall_status(records)
         summary = self._summary(status, records)
         return self._finish(task_state, status, records, modified, summary, instruction)
+
+    def _profile_commands(
+        self, discovered: Sequence[ValidationCommand], state: TaskState
+    ) -> tuple[ValidationCommand, ...]:
+        discovered_types = {item.check_type for item in discovered}
+        selected: list[ValidationCommand] = []
+        for check_type, command in self.profile.suggested_commands.items():
+            state.add_observation(
+                f"Comando sugerido considerado: {command}; origen: project_profile."
+            )
+            if not discovered and not state.repository_findings:
+                state.add_warning(
+                    f"Comando sugerido no ejecutado sin evidencia de compatibilidad: {command}."
+                )
+                continue
+            if check_type in discovered_types and all(
+                item.command != command
+                for item in discovered
+                if item.check_type == check_type
+            ):
+                state.add_warning(
+                    f"Comando sugerido desplazado por evidencia del repositorio: {command}."
+                )
+                continue
+            selected.append(
+                ValidationCommand(
+                    command, "project_profile", self.profile.name or "project_profile",
+                    check_type=check_type, priority=200,
+                )
+            )
+        return tuple(selected)
 
     def select_commands(
         self,
@@ -330,6 +376,21 @@ class TesterAgent(BaseAgent):
     def _execute(
         self, command: ValidationCommand, state: TaskState, index: int
     ) -> ValidationRecord:
+        decision = self.policy_engine.evaluate(
+            "run_command", {"command": command.command}, self.policy_context,
+            modifies_system=False,
+        )
+        if decision.outcome != "allow":
+            record = ValidationRecord(
+                command.command, command.origin, command.evidence, command.check_type,
+                None, 0.0, decision.reason, "blocked", 0
+            )
+            state.add_observation(
+                f"Política aplicada a comando {command.command}: "
+                f"{decision.outcome}; {decision.reason}"
+            )
+            self._record_state(state, record, index)
+            return record
         allowed, reason = self.safety_policy.validate(command.command)
         if not allowed:
             record = ValidationRecord(
@@ -360,6 +421,10 @@ class TesterAgent(BaseAgent):
             outcome.exit_code, outcome.duration_ms, output, status, attempts
         )
         state.record_command(command.command)
+        if command.origin == "project_profile":
+            state.add_observation(
+                f"Comando sugerido ejecutado: {command.command}; origen: project_profile."
+            )
         self._record_state(state, record, index)
         return record
 

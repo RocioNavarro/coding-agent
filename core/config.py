@@ -12,6 +12,9 @@ from urllib.parse import urlsplit
 import yaml
 
 from rag.models import SourceConfig
+from core.profiles import (
+    ProfileLoader, ProjectProfile, merge_profile_config, profile_to_config,
+)
 
 
 class AgentConfigError(ValueError):
@@ -186,6 +189,7 @@ class AgentConfig:
     memory: MemoryConfig
     observability: ObservabilityConfig
     web_search: WebSearchSettings
+    profile: ProjectProfile
 
 
 def load_agent_config(path: str | Path = "agent.config.yaml") -> AgentConfig:
@@ -198,6 +202,12 @@ def load_agent_config(path: str | Path = "agent.config.yaml") -> AgentConfig:
     except yaml.YAMLError as error:
         raise AgentConfigError(f"YAML inválido en '{config_path}': {error}") from error
     root = _mapping(raw, "configuración")
+    profile_value = root.pop("profile", None)
+    loaded_profile = ProjectProfile()
+    if profile_value is not None:
+        profile_text = _text(profile_value, "profile") or ""
+        loaded_profile = ProfileLoader().load(config_path.parent / profile_text)
+        root = merge_profile_config(profile_to_config(loaded_profile), root)
     _known(
         root,
         {"workspace", "project", "permissions", "commands", "limits", "rag", "memory", "observability", "web_search"},
@@ -228,6 +238,28 @@ def load_agent_config(path: str | Path = "agent.config.yaml") -> AgentConfig:
     return AgentConfig(
         workspace, project, permissions, commands, limits, rag, memory,
         observability, web_search,
+        _effective_profile(loaded_profile, project, commands, rag, web_search),
+    )
+
+
+def _effective_profile(
+    original: ProjectProfile,
+    project: ProjectMetadata | None,
+    commands: CommandsConfig,
+    rag: RagConfig,
+    web_search: WebSearchSettings,
+) -> ProjectProfile:
+    """Conserva datos exclusivos y refleja overrides de campos proyectados."""
+    return ProjectProfile(
+        name=project.name if project is not None else None,
+        description=project.description if project is not None else None,
+        expected_technologies=original.expected_technologies,
+        rag_sources=rag.sources,
+        priority_web_domains=web_search.priority_domains,
+        important_files=original.important_files,
+        suggested_commands=dict(commands),
+        additional_policies=original.additional_policies,
+        search_tags=original.search_tags,
     )
 
 

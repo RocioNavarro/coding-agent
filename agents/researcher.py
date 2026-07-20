@@ -12,6 +12,7 @@ from agents.base import AgentContext, AgentExecutionError, AgentInput, BaseAgent
 from core.llm_client import LLMClient
 from core.settings import AgentSettings
 from core.task_state import ErrorRecord, SourceOrigin, SourceReference, SubagentResult, TaskState
+from core.profiles import ProjectProfile
 from tools.registry import ToolRegistry
 
 
@@ -189,6 +190,7 @@ class ResearcherAgent(BaseAgent):
         web_search: WebSearchProvider | None = None,
         sufficiency_evaluator: EvidenceSufficiencyEvaluator | None = None,
         name: str = "researcher",
+        profile: ProjectProfile | None = None,
     ) -> None:
         super().__init__(
             name=name,
@@ -203,6 +205,7 @@ class ResearcherAgent(BaseAgent):
         self.sufficiency_evaluator = (
             sufficiency_evaluator or ThresholdSufficiencyEvaluator()
         )
+        self.profile = profile or ProjectProfile()
 
     @classmethod
     def from_settings(
@@ -214,15 +217,18 @@ class ResearcherAgent(BaseAgent):
         settings: AgentSettings,
         sufficiency_evaluator: EvidenceSufficiencyEvaluator | None = None,
         name: str = "researcher",
+        profile: ProjectProfile | None = None,
     ) -> "ResearcherAgent":
         """Compone Researcher con el fallback web habilitado por configuración."""
         provider: WebSearchProvider | None = None
         if settings.web_search_enabled and os.getenv("TAVILY_API_KEY"):
             from agents.web_research import ConfiguredWebSearchProvider, WebSearchConfig
 
-            provider = ConfiguredWebSearchProvider(
-                WebSearchConfig.from_dict(settings.web_search_config or {})
+            web_config = dict(settings.web_search_config or {})
+            web_config.setdefault(
+                "priority_domains", list((profile or ProjectProfile()).priority_web_domains)
             )
+            provider = ConfiguredWebSearchProvider(WebSearchConfig.from_dict(web_config))
         return cls(
             llm_client=llm_client,
             project_memory=project_memory,
@@ -230,6 +236,7 @@ class ResearcherAgent(BaseAgent):
             web_search=provider,
             sufficiency_evaluator=sufficiency_evaluator,
             name=name,
+            profile=profile,
         )
 
     def specialization_prompt(self) -> str:
@@ -396,6 +403,25 @@ class ResearcherAgent(BaseAgent):
             f"Pedido original: {task_state.original_request}",
             f"Instrucción de investigación: {instruction}",
         ]
+        confirmed = self._detected_technologies(task_state)
+        if confirmed:
+            parts.append("Tecnologías confirmadas por Explorer: " + ", ".join(confirmed))
+        if self.profile.expected_technologies:
+            parts.append(
+                "Hipótesis secundarias del perfil: "
+                + ", ".join(self.profile.expected_technologies)
+            )
+        if self.profile.search_tags:
+            parts.append("Tags de búsqueda del perfil: " + ", ".join(self.profile.search_tags))
+            task_state.add_observation(
+                "Tags usados en consultas: " + ", ".join(self.profile.search_tags)
+            )
+        if self.profile.rag_sources:
+            references = tuple(source.location for source in self.profile.rag_sources)
+            parts.append("Fuentes RAG efectivas configuradas: " + ", ".join(references))
+            task_state.add_observation(
+                "Fuentes RAG efectivas consideradas: " + ", ".join(references)
+            )
         if task_state.repository_findings:
             parts.append(
                 "Tecnologías, dependencias y configuración detectadas por Explorer: "
@@ -411,9 +437,8 @@ class ResearcherAgent(BaseAgent):
             parts.append("Contexto seleccionado: " + " | ".join(context.facts))
         return "\n".join(parts)
 
-    @staticmethod
     def _build_rag_filters(
-        state: TaskState, context: AgentContext | None
+        self, state: TaskState, context: AgentContext | None
     ) -> dict[str, tuple[str, ...]]:
         filters: dict[str, list[str]] = {}
         supported = {"technology", "language", "framework", "source_type", "module", "tags"}
@@ -433,6 +458,8 @@ class ResearcherAgent(BaseAgent):
                 key = key.strip().casefold()
                 if separator and key in supported and value.strip():
                     filters.setdefault(key, []).append(value.strip())
+        if self.profile.search_tags:
+            filters.setdefault("tags", []).extend(self.profile.search_tags)
         return {key: tuple(dict.fromkeys(values)) for key, values in filters.items()}
 
     @staticmethod

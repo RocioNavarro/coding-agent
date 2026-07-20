@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from collections.abc import Callable
 from typing import Literal, Protocol, Sequence
 
-from agents.base import AgentExecutionError
+from agents.base import AgentContext, AgentExecutionError
 from agents.implementer import ImplementerResult
 from agents.project_memory import (
     MemoryCorruptionError,
@@ -21,6 +21,7 @@ from agents.tester import TesterResult
 from core.llm_client import LLMClient
 from core.models import EvidenceAssessment, Message, PlanReview
 from core.task_state import ErrorRecord, SourceReference, SubagentResult, TaskState
+from core.profiles import ProjectProfile
 from core.observability import (
     NoOpObservabilityClient, ObservabilityClient, ObservabilityEvent,
     emit_observation, observation_context,
@@ -232,6 +233,7 @@ class MainAgent:
         max_iterations: int = 3,
         minimum_evidence_confidence: float = 0.5,
         observability: ObservabilityClient | None = None,
+        profile: ProjectProfile | None = None,
     ) -> None:
         if max_iterations < 1:
             raise ValueError("max_iterations debe ser al menos 1.")
@@ -251,6 +253,7 @@ class MainAgent:
         self._memory_available = True
         self.observability = observability or NoOpObservabilityClient()
         self._task_started = 0.0
+        self.profile = profile or ProjectProfile()
 
     def run(
         self,
@@ -284,11 +287,12 @@ class MainAgent:
             )
 
             state.set_phase("exploration")
+            profile_context = self._profile_context(state)
             with observation_context(
                 task_id=state.task_id,
                 parent_event_id=f"{state.task_id}:explorer:0", agent="explorer",
             ):
-                self.explorer.run(request, state)
+                self.explorer.run(request, state, profile_context)
             selected.append("explorer")
             self._record_agent(state, "explorer", 0)
 
@@ -301,7 +305,7 @@ class MainAgent:
                     task_id=state.task_id,
                     parent_event_id=f"{state.task_id}:researcher:0", agent="researcher",
                 ):
-                    research = self.researcher.run(request, state)
+                    research = self.researcher.run(request, state, profile_context)
                 selected.append("researcher")
                 self._record_agent(state, "researcher", 0)
                 if (
@@ -367,7 +371,7 @@ class MainAgent:
                             parent_event_id=f"{state.task_id}:explorer:{iteration}",
                             agent="explorer",
                         ):
-                            self.explorer.run(request, state)
+                            self.explorer.run(request, state, profile_context)
                         selected.append("explorer")
                         self._record_agent(state, "explorer", iteration)
                     if "fuentes de respaldo" in missing_evidence and self.researcher is not None:
@@ -377,7 +381,7 @@ class MainAgent:
                             parent_event_id=f"{state.task_id}:researcher:{iteration}",
                             agent="researcher",
                         ):
-                            self.researcher.run(request, state)
+                            self.researcher.run(request, state, profile_context)
                         selected.append("researcher")
                         self._record_agent(state, "researcher", iteration)
                     state.set_phase("evidence_assessment")
@@ -432,7 +436,9 @@ class MainAgent:
                     task_id=state.task_id,
                     parent_event_id=f"{state.task_id}:tester:{iteration}", agent="tester",
                 ):
-                    testing = self.tester.run("Validar los cambios aplicados", state)
+                    testing = self.tester.run(
+                        "Validar los cambios aplicados", state, profile_context
+                    )
                 selected.append("tester")
                 self._record_agent(state, "tester", iteration)
 
@@ -580,5 +586,36 @@ class MainAgent:
                          "output": result.summary or result.result,
                          "status": result.status, "blockers": result.blockers,
                          "confidence": result.confidence, "error": result.error},
+            ),
+        )
+
+    def _profile_context(self, state: TaskState) -> AgentContext:
+        if not any((self.profile.name, self.profile.expected_technologies,
+                    self.profile.important_files, self.profile.search_tags,
+                    self.profile.additional_policies)):
+            return AgentContext()
+        state.add_observation(f"Perfil activo: {self.profile.name or 'sin nombre'}.")
+        if self.profile.expected_technologies:
+            state.add_observation(
+                "Tecnologías esperadas por perfil: "
+                + ", ".join(self.profile.expected_technologies)
+            )
+        if self.profile.additional_policies:
+            state.add_observation(
+                "Políticas adicionales disponibles: "
+                + ", ".join(self.profile.additional_policies)
+            )
+        facts = tuple(
+            [f"profile_expected_technology:{item}"
+             for item in self.profile.expected_technologies]
+            + [f"rag_filter:tags={item}" for item in self.profile.search_tags]
+            + [f"profile_suggested_command:{name}={command}"
+               for name, command in self.profile.suggested_commands.items()]
+        )
+        return AgentContext(
+            facts=facts,
+            files=self.profile.important_files,
+            constraints=(
+                "Los datos del perfil son hipótesis y preferencias; requieren evidencia.",
             ),
         )

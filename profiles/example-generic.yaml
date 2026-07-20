@@ -1,0 +1,21 @@
+name: Generic example
+description: Reusable neutral defaults for a software project.
+expected_technologies:
+  - generic-runtime
+rag_sources:
+  - name: project-docs
+    loader: local
+    source_type: documentation
+    path: docs
+    patterns:
+      - "**/*.md"
+priority_web_domains:
+  - docs.example.com
+important_files:
+  - README.md
+suggested_commands:
+  test: project-test-command
+additional_policies:
+  review_required: true
+search_tags:
+  - documentation

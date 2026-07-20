@@ -20,6 +20,7 @@ from agents.repository_detection import (
 )
 from core.llm_client import LLMClient
 from core.task_state import SourceReference, SubagentResult, TaskState
+from core.profiles import ProjectProfile
 from tools.definitions import ToolDefinition
 from tools.registry import ToolRegistry
 
@@ -134,6 +135,7 @@ class ExplorerAgent(BaseAgent):
         llm_client: LLMClient,
         detectors: Sequence[RepositoryDetector] | None = None,
         project_memory: ProjectMemory | None = None,
+        profile: ProjectProfile | None = None,
         name: str = "explorer",
     ) -> None:
         super().__init__(
@@ -148,6 +150,7 @@ class ExplorerAgent(BaseAgent):
             raise ValueError("repository_root debe ser un directorio existente.")
         self.repository_root = root
         self.project_memory = project_memory
+        self.profile = profile or ProjectProfile()
         self.detectors = tuple(
             detectors
             if detectors is not None
@@ -172,6 +175,7 @@ class ExplorerAgent(BaseAgent):
     ) -> SubagentResult:
         report = self.explore(instruction)
         self._record_report(report, task_state)
+        self._record_profile(report, task_state)
         self._record_memory(report)
         existing = context or AgentContext()
         bounded_context = AgentContext(
@@ -306,13 +310,17 @@ class ExplorerAgent(BaseAgent):
             )
         return tuple(detections)
 
-    @staticmethod
     def _select_relevant_files(
+        self,
         instruction: str,
         inventory: RepositoryInventory,
         detections: Sequence[RepositoryDetection],
     ) -> tuple[str, ...]:
-        tokens = {token.casefold() for token in instruction.replace("_", " ").split() if len(token) >= 3}
+        tokens = {
+            token.casefold()
+            for token in " ".join((instruction, *self.profile.search_tags)).replace("_", " ").split()
+            if len(token) >= 3
+        }
         matches = [
             path for path in inventory.files if any(token in path.casefold() for token in tokens)
         ]
@@ -322,7 +330,37 @@ class ExplorerAgent(BaseAgent):
             *inventory.documentation_files[:10],
             *inventory.entry_points,
         ]
-        return tuple(dict.fromkeys((*matches[:50], *evidence, *supporting)))
+        important = [path for path in self.profile.important_files if path in inventory.files]
+        return tuple(dict.fromkeys((*important, *matches[:50], *evidence, *supporting)))
+
+    def _record_profile(self, report: ExplorerReport, state: TaskState) -> None:
+        if not any((self.profile.name, self.profile.expected_technologies,
+                    self.profile.important_files, self.profile.search_tags)):
+            return
+        detected = {
+            item.name.casefold(): item.name
+            for item in report.detections
+            if item.category in {"language", "framework", "test_framework", "tool", "build_system", "technology"}
+        }
+        state.add_observation(f"Perfil efectivo: {self.profile.name or 'sin nombre'}.")
+        for expected in self.profile.expected_technologies:
+            confirmed = detected.get(expected.casefold())
+            if confirmed:
+                state.add_observation(
+                    f"Tecnología esperada por perfil confirmada: {expected}; detectada: {confirmed}."
+                )
+            else:
+                state.add_warning(
+                    f"Discrepancia de perfil: tecnología esperada no confirmada: {expected}."
+                )
+        used = tuple(path for path in self.profile.important_files if path in report.inventory.files)
+        missing = tuple(path for path in self.profile.important_files if path not in report.inventory.files)
+        if used:
+            state.add_observation("Archivos importantes utilizados: " + ", ".join(used))
+        if missing:
+            state.add_warning("Archivos importantes no encontrados: " + ", ".join(missing))
+        if self.profile.search_tags:
+            state.add_observation("Tags de búsqueda usados: " + ", ".join(self.profile.search_tags))
 
     @staticmethod
     def _summarize(
