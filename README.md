@@ -1,29 +1,55 @@
-# Coding Agent — Parte 1
+# Coding Agent
 
-## Objetivo
+Coding agent educativo implementado en Python sin frameworks de orquestación como
+LangChain, LangGraph, CrewAI o AutoGen. El proyecto conecta un LLM con herramientas
+locales mediante tool calling, conserva el historial de chat y aplica planificación,
+supervisión, políticas, evidencia, memoria, RAG y observabilidad mediante contratos
+propios e inyección de dependencias.
 
-Coding agent educativo implementado desde cero en Python, sin frameworks de
-orquestación. Conecta la Responses API de OpenAI con tools locales mediante tool
-calling, conserva el historial y ofrece planificación y supervisión interactivas.
+El entry point público actual, `python main.py`, implementa los dos loops obligatorios:
 
-El alcance de la Parte 1 es permitir que un usuario converse con el agente para
-explorar y modificar proyectos ubicados en `workspace/`, ejecutar verificaciones
-y consultar la web, manteniendo control explícito sobre la planificación y las
-operaciones sensibles.
+1. un loop externo de chat que conserva el historial entre mensajes;
+2. un loop interno que llama al LLM, ejecuta tool calls y repite hasta obtener una
+   respuesta final o alcanzar el límite de iteraciones.
+
+La arquitectura multiagente (`MainAgent`, Explorer, Researcher, Implementer, Tester
+y Reviewer) está implementada como una capa componible y cubierta por escenarios
+integrales deterministas. Todavía no reemplaza al bootstrap interactivo de `main.py`.
+
+## Caso de uso: PrintScript
+
+El caso de evaluación previsto es asistir sobre un checkout de PrintScript situado
+dentro del workspace autorizado. El agente puede utilizarse para:
+
+- relevar módulos, configuración, convenciones y comandos respaldados por archivos;
+- consultar documentación indexada mediante RAG;
+- proponer un cambio localizado y someterlo a aprobación;
+- validar evidencia, alcance y políticas antes de escribir;
+- ejecutar únicamente verificaciones descubiertas o configuradas;
+- presentar archivos modificados, validaciones, fuentes y bloqueos.
+
+Este repositorio no incluye PrintScript, credenciales, un perfil específico ni una
+corrida real contra ese proyecto. Los comandos de build o test deben descubrirse en
+el checkout o configurarse explícitamente; no se documenta ninguno como válido sin
+haberlo verificado allí.
 
 ## Requisitos
 
 - Python 3.10 o superior.
-- Una API key de OpenAI y un modelo con soporte de tool calling.
-- Una API key de Tavily para `web_search`.
+- `pip` y soporte para entornos virtuales.
+- Para el chat real: `OPENAI_API_KEY` y `OPENAI_MODEL`.
+- Para búsqueda web real: `TAVILY_API_KEY`.
+- Para Langfuse real, opcional: credenciales de Langfuse.
+
+Los tests usan clientes falsos y no requieren red, credenciales ni proveedores
+externos.
 
 ## Instalación
-
-Crear y activar un entorno virtual:
 
 ```bash
 python3.10 -m venv .venv
 source .venv/bin/activate
+python -m pip install -e ".[dev]"
 ```
 
 En Windows PowerShell, la activación equivalente es:
@@ -32,176 +58,460 @@ En Windows PowerShell, la activación equivalente es:
 .venv\Scripts\Activate.ps1
 ```
 
-`pyproject.toml` es la fuente principal de dependencias. Para instalar el proyecto
-en modo editable con las dependencias de desarrollo:
-
-```bash
-python -m pip install -e ".[dev]"
-```
-
-Como alternativa, `requirements.txt` mantiene los mismos rangos de versiones:
+También existe un archivo de dependencias compatible:
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-## Variables de entorno
+## Configuración
 
-El programa carga automáticamente el archivo `.env` de la raíz al iniciar. Se
-puede crear a partir del ejemplo:
+La sesión combina tres fuentes:
+
+1. variables de entorno para credenciales y selección de proveedores;
+2. `agent.config.yaml` para workspace, permisos, límites, RAG, memoria y web;
+3. un `ProjectProfile` opcional como base reutilizable, sobre el cual la configuración
+   explícita del usuario tiene prioridad.
+
+Para partir del ejemplo:
 
 ```bash
+cp agent.config.example.yaml agent.config.yaml
 cp .env.example .env
-# Completar .env sin commitearlo.
 ```
 
-Las variables ya exportadas en el entorno tienen prioridad sobre los valores de
-`.env`.
+No se deben versionar secretos. El código y los eventos de observabilidad aplican
+sanitización recursiva, pero eso no reemplaza una gestión segura de credenciales.
 
-Variables requeridas:
+## Variables de entorno
 
-- `OPENAI_API_KEY`: credencial de la API de OpenAI.
-- `OPENAI_MODEL`: identificador del modelo que usará Responses API.
-- `TAVILY_API_KEY`: credencial utilizada por la tool `web_search`.
+| Variable | Uso | Obligatoria |
+|---|---|---|
+| `OPENAI_API_KEY` | Autenticación del cliente LLM | Para `python main.py` |
+| `OPENAI_MODEL` | Modelo enviado a la Responses API | Para `python main.py` |
+| `TAVILY_API_KEY` | Búsqueda web mediante Tavily | Sólo si se usa web real |
+| `CODING_AGENT_CONFIG` | Ruta alternativa a `agent.config.yaml` | No |
+| `CODING_AGENT_WEB_SEARCH_ENABLED` | Activa/desactiva web (`true`/`false` y equivalentes) | No |
+| `CODING_AGENT_WEB_SEARCH_CONFIG` | Configuración web adicional como objeto JSON | No |
+| `CODING_AGENT_OBSERVABILITY_ENABLED` | Habilita la factory de observabilidad | No; default `false` |
+| `LANGFUSE_PUBLIC_KEY` | Credencial pública de Langfuse | Sólo con observabilidad real |
+| `LANGFUSE_SECRET_KEY` | Credencial secreta de Langfuse | Sólo con observabilidad real |
+| `LANGFUSE_HOST` | Host alternativo de Langfuse | No |
 
-No deben incluirse secretos reales en el código ni en archivos versionados.
+Si observabilidad está deshabilitada, faltan credenciales o falla el proveedor, la
+factory utiliza `NoOpObservabilityClient` y la tarea principal continúa.
 
-## Ejecución
+## `agent.config.yaml`
+
+El loader es estricto: rechaza YAML inválido, campos desconocidos, rutas locales que
+escapen del workspace y combinaciones incoherentes. Un ejemplo funcional de esquema
+es:
+
+```yaml
+workspace:
+  path: workspace
+  ignore:
+    - .git/**
+    - .cache/**
+
+permissions:
+  read: true
+  write: false
+  run_commands: false
+  web_search: false
+
+commands: {}
+
+limits:
+  max_iterations: 20
+  context_chars: 8000
+  command_timeout_seconds: 60
+  max_rag_results: 5
+  max_web_results: 5
+
+rag:
+  enabled: false
+  index_path: .coding-agent/rag/index.json
+  sources: []
+
+memory:
+  enabled: true
+  path: .coding-agent/memory
+  identifier: null
+
+observability:
+  enabled: true
+  log_level: INFO
+  trace_tools: true
+
+web_search:
+  enabled: false
+  allowed_domains: []
+  priority_domains: []
+  blocked_domains: []
+  max_results: 5
+  technology_domains: {}
+```
+
+Para heredar un perfil se agrega, en la raíz:
+
+```yaml
+profile: profiles/example-generic.yaml
+```
+
+El repositorio incluye solamente `profiles/default.yaml` y un ejemplo genérico. Los
+valores explícitos de `agent.config.yaml` reemplazan escalares y listas heredadas;
+los diccionarios se combinan recursivamente. Una lista vacía explícita elimina la
+lista heredada. El perfil orienta a los agentes, pero tecnologías esperadas nunca se
+presentan como detectadas sin evidencia del repositorio.
+
+Actualmente las file tools del entry point público están confinadas al directorio
+`workspace/`. Para la CLI conviene mantener `workspace.path: workspace`; la
+composición avanzada permite inyectar otras raíces confinadas.
+
+## Indexación RAG
+
+El indexador usa un manifiesto JSON independiente. Ejemplo:
+
+```json
+{
+  "index_path": ".coding-agent/rag/index.json",
+  "sources": [
+    {
+      "name": "project-docs",
+      "loader": "local",
+      "source_type": "documentation",
+      "path": "docs",
+      "parser": "sections",
+      "patterns": ["**/*.md"],
+      "tags": ["project"]
+    }
+  ],
+  "chunking": {
+    "max_characters": 1500,
+    "overlap_characters": 150,
+    "respect_sections": true
+  },
+  "embedding": {
+    "provider": "hash",
+    "dimensions": 128
+  }
+}
+```
+
+El indexador se ejecuta como módulo:
+
+```bash
+python -m rag.cli path/to/manifest.json
+```
+
+Para eliminar del índice documentos que ya no aparecen en el manifiesto:
+
+```bash
+python -m rag.cli path/to/manifest.json --prune
+```
+
+Las fuentes locales relativas se resuelven respecto del manifiesto. Los loaders URL
+realizan acceso de red y sólo deben usarse cuando fueron configurados explícitamente.
+
+## Ejecución del agente
 
 ```bash
 python main.py
 ```
 
-Comandos interactivos:
+Comandos del chat:
 
-- `/exit`: cerrar el chat.
-- `/status`: mostrar la configuración activa.
-- `/plan on` y `/plan off`: activar o desactivar plan mode.
-- `/supervision on` y `/supervision off`: activar o desactivar supervisión.
+- `/status`: muestra Plan mode, Supervision mode y límites activos;
+- `/plan on` y `/plan off`: activan o desactivan planificación previa;
+- `/supervision on` y `/supervision off`: controlan confirmación de tools mutadoras;
+- `/exit`: finaliza el chat.
 
-Los mensajes vacíos se ignoran. `Ctrl+C` y EOF cierran la sesión de forma
-controlada.
+Los mensajes vacíos se ignoran. `Ctrl+C` y EOF finalizan de forma controlada.
 
-## Arquitectura
+## Aprobación, rechazo y modificación de planes
 
-- `main.py`: loop externo, comandos y diálogo interactivo.
-- `core/harness.py`: planificación y loop interno de tool calling.
-- `core/llm_client.py`: protocolo propio y adaptador de OpenAI.
-- `core/models.py`: modelos independientes del SDK del proveedor.
-- `core/supervision.py`: aprobación de operaciones modificadoras.
-- `tools/`: implementaciones y registro de tools.
-- `security/`: políticas de rutas y comandos.
-- `workspace/`: único directorio de trabajo permitido para las tools locales.
-- `tests/`: suite unitaria con pytest y proveedores externos simulados.
+Con Plan mode activo, el LLM recibe el historial pero no schemas de tools. Después
+de mostrar el plan, la CLI solicita:
 
-### Loop externo
+- `a` o `aprobar`: aprueba el plan y habilita la fase de ejecución;
+- `r` o `rechazar`: cancela el pedido sin ejecutar tools;
+- `m` o `modificar`: solicita una instrucción de cambio y genera un plan completo
+  nuevo.
 
-Inicializa el historial con un system prompt, recibe mensajes, procesa comandos
-locales, agrega cada pedido y ejecuta un turno. Después muestra la respuesta final
-y la cantidad de iteraciones, conservando el historial para el mensaje siguiente.
+Un plan vacío, una tool call durante planificación o agotar las revisiones produce
+un error controlado. Aprobar el plan no evita las políticas ni las confirmaciones
+individuales posteriores.
 
-### Loop interno
+## Arquitectura general
 
-Envía el historial y los schemas al LLM, registra la respuesta, valida y ejecuta
-las tool calls, agrega sus resultados correlacionados al historial y repite hasta
-obtener una respuesta sin tools. `max_iterations` evita ciclos indefinidos.
+```mermaid
+flowchart LR
+    User[Usuario] --> Chat[main.py\nloop externo]
+    Chat --> Planning[Planning loop]
+    Chat --> Internal[Internal tool-calling loop]
+    Planning --> LLM[LLMClient]
+    Internal --> LLM
+    Internal --> Supervision[SupervisedToolExecutor]
+    Supervision --> Policy[PolicyEngine]
+    Supervision --> Tools[ToolRegistry]
+    Tools --> Local[Files y comandos]
+    Tools --> Web[Web search]
 
-## Tools disponibles
+    Orchestrator[MainAgent componible] --> Explorer
+    Orchestrator --> Researcher
+    Orchestrator --> Preflight[PolicyPreflight]
+    Orchestrator --> Evidence[EvidenceSufficiencyPolicy]
+    Orchestrator --> Implementer
+    Orchestrator --> Tester
+    Orchestrator --> Reviewer
+    Explorer <--> Memory[ProjectMemory]
+    Researcher --> Memory
+    Researcher --> RAG[RAG Retriever]
+    Researcher --> Web
+    Orchestrator <--> State[TaskState]
 
-- `read_file`: lee un archivo UTF-8 dentro de `workspace/`.
-- `write_file`: reemplaza un archivo dentro de `workspace/`.
-- `list_files`: lista un directorio dentro de `workspace/`.
-- `run_command`: ejecuta un comando validado con `cwd=workspace/` y `shell=False`.
-- `web_search`: consulta Tavily y devuelve resultados breves y estructurados.
+    Chat -. eventos .-> Obs[ObservabilityClient]
+    Orchestrator -. eventos .-> Obs
+```
 
-## Plan mode
+Responsabilidades principales:
 
-Cuando está activo, el LLM propone un plan sin recibir schemas de tools. El usuario
-puede aprobarlo, rechazarlo o pedir una modificación. Ninguna tool se expone ni se
-ejecuta antes de aprobar. Sólo el plan aprobado se incorpora al contexto principal.
+- `main.py`: composición pública, comandos interactivos e historial de sesión.
+- `core/harness.py`: loops de planificación y tool calling.
+- `core/llm_client.py`: contrato LLM, adaptador OpenAI, tokens y latencia.
+- `tools/`: schemas, validación y ejecución de tools.
+- `security/`: políticas de rutas, comandos, evidencia y autorización.
+- `core/planned_operations.py`: intención estructurada y preflight anticipado.
+- `agents/`: orquestador y agentes especializados.
+- `rag/`: ingesta, chunking, embeddings, índice y recuperación.
 
-## Supervision mode
+## Flujo completo de una tarea multiagente
 
-Cuando está activo, `write_file` y `run_command` requieren confirmación previa.
-`read_file`, `list_files` y `web_search` se consideran de sólo lectura y no piden
-aprobación. Desactivar supervisión no desactiva las políticas de seguridad.
+```mermaid
+flowchart TD
+    Request[Pedido original] --> Analyze[Clasificar tarea]
+    Analyze --> MemoryQuery[Consultar memoria]
+    MemoryQuery --> Explore[Explorer\ncompleto o incremental]
+    Explore --> Research{¿Requiere investigación?}
+    Research -- sí --> Sources[Memoria → RAG → evaluar → web si falta]
+    Research -- no --> Plan
+    Sources --> Plan[Generar plan]
+    Plan --> ReviewPlan{Decisión del usuario}
+    ReviewPlan -- modificar --> Plan
+    ReviewPlan -- rechazar --> Cancel[Final controlado]
+    ReviewPlan -- aprobar --> Kind{¿Sólo análisis?}
+    Kind -- sí --> AnalysisReview[Reviewer opcional]
+    AnalysisReview --> Final[Presentar resultado]
+    Kind -- no --> Operations[PlannedOperationProvider]
+    Operations --> Preflight[PolicyPreflight]
+    Preflight -- deny --> Stop[Safe stop]
+    Preflight -- aprobación pendiente --> Approval[Aprobación por fingerprint]
+    Approval -- no --> Stop
+    Approval -- sí --> Evidence
+    Preflight -- allow --> Evidence[EvidenceSufficiencyPolicy]
+    Evidence -- partial --> More[Obtener más evidencia]
+    More --> Evidence
+    Evidence -- insufficient --> Stop
+    Evidence -- sufficient --> Apply[Implementer apply_changes]
+    Apply --> RuntimePolicy[Política defensiva en ejecución]
+    RuntimePolicy --> Test[Tester + ProgressMonitor]
+    Test --> FinalReview[Reviewer]
+    FinalReview -- cambios --> Plan
+    FinalReview -- aprobado --> Final
+```
 
-## Seguridad del workspace
+## Agente principal
 
-Las file tools resuelven rutas dentro de `workspace/`, rechazan escapes mediante
-`..`, rutas absolutas externas, symlinks que escapen y archivos `.env`.
+`MainAgent` coordina fases mediante Python normal. Crea `TaskState`, selecciona
+agentes, conserva el plan aprobado, ejecuta preflight antes de evidencia y escritura,
+interpreta resultados de Tester/Reviewer, limita iteraciones y presenta bloqueos
+estructurados. La opción `review_analysis_tasks` permite revisar análisis sin
+habilitar Implementer ni escritura.
 
-`run_command` usa una política previa que revisa el comando completo. Bloquea
-operaciones destructivas conocidas, `git push`, `git reset --hard`, ejecución de
-código inline mediante intérpretes, wrappers de subcomandos, secretos configurados
-y rutas externas. Siempre usa `shell=False`, timeout y `cwd=workspace/`.
+## Subagentes
 
-Esta es una política de validación defensiva para la Parte 1, no un sandbox fuerte
-del sistema operativo. Un ejecutable o script permitido puede tener comportamiento
-arbitrario que el análisis de argumentos no detecte. Para ejecutar código no
-confiable se necesitaría aislamiento adicional mediante contenedores, namespaces,
-permisos del sistema operativo u otra tecnología fuera del alcance de esta parte.
+- **Explorer:** inventaría el workspace, detecta estructura y tecnologías con
+  evidencia, prioriza archivos del perfil y realiza exploración incremental cuando
+  hay fingerprints vigentes.
+- **Researcher:** consulta en orden memoria → RAG → evaluación de suficiencia → web
+  como fallback; conserva fuentes y separa hechos de inferencias.
+- **Implementer:** selecciona fragmentos, propone reemplazos exactos y sólo aplica
+  cambios con plan y `EvidenceAssessment` sufficient vigentes.
+- **Tester:** selecciona comandos respaldados, aplica `PolicyEngine`, ejecuta con
+  límites y registra resultados normalizados y progreso.
+- **Reviewer:** revisa evidencia, diff, validaciones, alcance y riesgos; puede aprobar,
+  pedir cambios, bloquear o indicar evidencia insuficiente.
+
+Todos reciben dependencias explícitas. Los tests pueden inyectar LLM, memoria, RAG,
+web, command runners, aprobación y observabilidad falsos.
+
+## Estado compartido
+
+`TaskState` registra de forma serializable:
+
+- pedido, estado y fase;
+- plan propuesto y aprobado;
+- resultados de subagentes y fuentes;
+- hallazgos, archivos leídos/modificados y comandos;
+- tool calls, errores, advertencias y observaciones;
+- `EvidenceAssessment` ligado a la versión vigente del plan;
+- operaciones planificadas, decisiones de preflight y fingerprints aprobados;
+- resultado final.
+
+Cambiar el plan invalida la evaluación de evidencia. Una aprobación de preflight se
+asocia al fingerprint exacto de tipo, target, parámetros, versión del plan y origen.
+
+## Memoria persistente
+
+`ProjectMemory` almacena JSON por workspace usando reemplazo atómico y permisos de
+archivo restrictivos. Conserva arquitectura, tecnologías, módulos, archivos
+importantes, dependencias, comandos, convenciones, decisiones, bugs, tareas previas,
+resúmenes y fingerprints de exploración.
+
+La memoria es una pista, no una verdad actual. Explorer compara tamaño y `mtime_ns`,
+revalida una muestra estable, inspecciona archivos nuevos o modificados y vuelve a
+exploración completa ante ausencia o corrupción. El identificador configurado se
+combina con un hash del workspace para mantener aislamiento.
+
+## RAG
+
+### Fuentes
+
+`ConfiguredSourceLoader` admite fuentes `local` y `url` declaradas. Los directorios
+locales requieren `patterns`; no se descubren fuentes implícitamente.
+
+### Chunking
+
+`SectionDocumentParser` reconoce encabezados Markdown. `WhitespaceNormalizer`
+normaliza espacios preservando párrafos. `ConfigurableChunker` permite longitud
+máxima, solapamiento y respeto por secciones.
+
+### Embeddings
+
+La instalación incluye `HashEmbeddingProvider`, local y determinista. Produce
+vectores normalizados y sirve para pruebas y funcionamiento sin proveedor externo;
+no equivale semánticamente a un modelo de embeddings entrenado.
+
+### Almacenamiento y recuperación
+
+`JsonVectorStore` persiste documentos, hashes, chunks, embeddings y metadata en un
+JSON versionado mediante reemplazo atómico. El indexador evita reindexar contenido
+sin cambios, deduplica chunks y puede podar documentos. El retriever devuelve
+identificadores, scores, documentos y trazabilidad de chunks recuperados/utilizados.
+
+## Políticas de seguridad
+
+- Las tools locales están confinadas al workspace.
+- Se rechazan escapes `..`, rutas absolutas externas, symlinks de escape y archivos
+  sensibles como `.env`.
+- `run_command` usa `shell=False`, cwd confinado y timeout.
+- Se bloquean comandos destructivos conocidos, wrappers, `git push`,
+  `git reset --hard`, evaluación inline y argumentos con rutas externas.
+- Plan mode y Supervision mode agregan aprobación humana, pero no relajan políticas.
+- `PolicyPreflight` evalúa operaciones estructuradas antes de `apply_changes`.
+- Las políticas se vuelven a aplicar al ejecutar tools o comandos.
+- Los perfiles pueden agregar restricciones, nunca relajar reglas base.
+- Los secretos se sanitizan antes de observabilidad.
+
+Estas defensas no constituyen un sandbox fuerte del sistema operativo. Ejecutar
+código no confiable requiere aislamiento externo adicional.
+
+## Detección de loops y falta de progreso
+
+`ProgressMonitor` normaliza acciones y detecta:
+
+- mismo comando con el mismo error;
+- lecturas, búsquedas o modificaciones repetidas;
+- diffs idénticos;
+- ciclos entre agentes;
+- iteraciones sin evidencia nueva.
+
+Devuelve recomendaciones estructuradas: `retry_with_new_strategy`, `replan`,
+`ask_user` o `stop`. Los límites son configurables y el orquestador además aplica
+`max_iterations`, por lo que no reintenta indefinidamente.
+
+## Suficiencia de evidencia
+
+Antes de escribir, `EvidenceSufficiencyPolicy` considera componente, comportamiento
+esperado, convenciones, impacto, archivos objetivo existentes, fuentes, validaciones,
+permisos, contradicciones y riesgos.
+
+- `sufficient`: permite continuar.
+- `partial`: solicita Explorer/Researcher adicional y no escribe todavía.
+- `insufficient`: bloquea y devuelve faltantes, riesgos, acción y confianza.
+
+Ambigüedad, archivos inexistentes, contradicciones, permisos insuficientes, ausencia
+de validación o riesgo excesivo impiden presentar la evidencia como suficiente.
+Además, una tarea de modificación necesita operaciones estructuradas; el texto libre
+del plan no se convierte en acciones mediante heurísticas.
+
+## Observabilidad
+
+`ObservabilityClient` desacopla el núcleo del proveedor. Hay implementaciones
+No-Op y Langfuse; los fakes permiten verificar jerarquías sin red. La instrumentación
+registra, cuando están disponibles, tarea, agentes, prompts, modelo, llamadas LLM,
+tools, memoria, RAG, web, políticas, evidencia, progreso, errores, latencia, tokens y
+resultado.
+
+Los eventos forman una jerarquía lógica con una observación raíz por tarea y eventos
+hijos por agente/componente. La sanitización es central y recursiva. Los errores del
+proveedor no interrumpen la tarea. `estimated_cost` permanece `None` si no existe una
+tabla explícita de precios; el sistema no inventa costos.
 
 ## Tests
 
+Suite completa:
+
 ```bash
-python -m pytest tests
+python -m pytest -q
 ```
 
-Los clientes de OpenAI y Tavily se prueban con mocks; la suite no consume APIs ni
-internet. Los tests cubren loops, historial, planificación, supervisión, tools,
-límites, errores y políticas de seguridad.
+Sólo escenarios integrales:
 
-## Ejemplos de uso
+```bash
+python -m pytest tests/integration -q
+```
 
-Los siguientes pedidos se pueden ingresar en el chat después de ejecutar
-`python main.py`. Los resultados dependen del modelo configurado y deben revisarse
-antes de aprobar planes u operaciones sensibles.
+Los tests no utilizan OpenAI, Tavily, Langfuse ni red reales. Cubren loops, tools,
+configuración, perfiles, subagentes, memoria, RAG, políticas, evidencia,
+observabilidad y escenarios completos con repositorios temporales.
 
-### Ejemplo 1: diagnosticar y corregir un bug
+## Reproducir los escenarios de evidencia
 
-El proyecto inicial está en `workspace/bug_demo/`. Prompt sugerido:
+Cada escenario crea un repositorio aislado mediante `tmp_path` y usa fakes
+deterministas:
 
-> Explorá el proyecto bug_demo, encontrá por qué fallan los tests, corregí el
-> problema y verificá que todos los tests pasen.
+```bash
+python -m pytest tests/integration/test_analysis_scenario.py -q
+python -m pytest tests/integration/test_simple_change_scenario.py -q
+python -m pytest tests/integration/test_rag_scenario.py -q
+python -m pytest tests/integration/test_memory_scenario.py -q
+python -m pytest tests/integration/test_failed_command_scenario.py -q
+python -m pytest tests/integration/test_blocked_operation_scenario.py -q
+```
 
-### Ejemplo 2: implementar funcionalidad nueva
+Los escenarios demuestran análisis sin escritura, cambio localizado, RAG sin web,
+recarga real de memoria, comando fallido con detección de progreso y safe stop por
+preflight. Las aserciones de los tests son la evidencia reproducible; este README no
+declara resultados de una corrida externa no ejecutada.
 
-El proyecto inicial está en `workspace/palindrome_demo/`. Prompt sugerido:
+## Limitaciones conocidas
 
-> En palindrome_demo, creá una función is_palindrome que ignore mayúsculas,
-> espacios y signos de puntuación. Agregá tests y verificá que pasen.
-
-Estos ejemplos no documentan resultados todavía. Las dos corridas entregables se
-registrarán una vez terminada la implementación completa de la Parte 1.
-
-## Evidencias
-
-Esta sección queda preparada para pegar evidencias reales. No completar campos sin
-haber ejecutado y verificado la corrida correspondiente.
-
-### Corrida 1
-
-- Output o enlace a la evidencia:
-- Cantidad de iteraciones:
-- Qué salió bien:
-- Qué salió mal:
-
-### Corrida 2
-
-- Output o enlace a la evidencia:
-- Cantidad de iteraciones:
-- Qué salió bien:
-- Qué salió mal:
-
-### Mejoras futuras
-
-- Pendiente de completar después de analizar ambas corridas.
-
-## Limitaciones y trabajo futuro
-
-- `run_command` aplica reglas explícitas, pero no es un sandbox de sistema operativo.
-- `.env` se carga al iniciar y debe permanecer fuera del control de versiones.
-- La calidad de planes y tool calls depende del modelo configurado.
-- Las corridas demostrativas todavía no tienen evidencias ni resultados documentados.
-- Funcionalidades adicionales quedan fuera del alcance de la Parte 1.
+- La CLI pública todavía utiliza el harness directo y no compone automáticamente
+  `MainAgent` ni los subagentes avanzados.
+- Para la CLI pública, las file tools concretas siguen usando `workspace/`; un
+  workspace alternativo requiere una composición explícita coherente.
+- `HashEmbeddingProvider` es determinista pero no ofrece embeddings semánticos de la
+  calidad de un modelo entrenado.
+- El índice JSON es auditable y adecuado para el TP, no para grandes volúmenes ni
+  concurrencia distribuida.
+- La exploración incremental usa tamaño y `mtime_ns`; cambios que preserven ambos
+  metadatos podrían requerir una exploración completa manual.
+- El preflight sólo crea operaciones desde intención estructurada. No interpreta
+  menciones en texto libre como acciones.
+- La política de comandos reduce riesgos conocidos, pero no puede determinar el
+  comportamiento interno de cualquier ejecutable permitido.
+- La búsqueda web y las fuentes RAG URL requieren red y credenciales/configuración
+  externas; su disponibilidad no está garantizada.
+- No se incluye una corrida ni un perfil específico de PrintScript.
