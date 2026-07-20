@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from agents.base import AgentContext, BaseAgent
-from agents.project_memory import ProjectMemory
+from agents.project_memory import MemoryCorruptionError, ProjectMemory, ProjectMemoryError
 from agents.repository_detection import (
     BuildSystemDetector,
     DetectionEvidence,
@@ -21,6 +21,10 @@ from agents.repository_detection import (
 from core.llm_client import LLMClient
 from core.task_state import SourceReference, SubagentResult, TaskState
 from core.profiles import ProjectProfile
+from core.observability import (
+    NoOpObservabilityClient, ObservabilityClient, ObservabilityEvent,
+    emit_observation,
+)
 from tools.definitions import ToolDefinition
 from tools.registry import ToolRegistry
 
@@ -94,6 +98,7 @@ class ExplorerReport:
     conventions: tuple[RepositoryDetection, ...]
     relevant_files: tuple[str, ...]
     architecture_summary: str
+    exploration_metrics: Mapping[str, object] = field(default_factory=dict)
 
     def facts(self) -> tuple[str, ...]:
         facts = [f"Resumen de arquitectura: {self.architecture_summary}"]
@@ -136,6 +141,7 @@ class ExplorerAgent(BaseAgent):
         detectors: Sequence[RepositoryDetector] | None = None,
         project_memory: ProjectMemory | None = None,
         profile: ProjectProfile | None = None,
+        observability: ObservabilityClient | None = None,
         name: str = "explorer",
     ) -> None:
         super().__init__(
@@ -150,6 +156,7 @@ class ExplorerAgent(BaseAgent):
             raise ValueError("repository_root debe ser un directorio existente.")
         self.repository_root = root
         self.project_memory = project_memory
+        self.observability = observability or NoOpObservabilityClient()
         self.profile = profile or ProjectProfile()
         self.detectors = tuple(
             detectors
@@ -174,6 +181,7 @@ class ExplorerAgent(BaseAgent):
         available_tools: ToolRegistry | None = None,
     ) -> SubagentResult:
         report = self.explore(instruction)
+        self._record_exploration_strategy(report, task_state)
         self._record_report(report, task_state)
         self._record_profile(report, task_state)
         self._record_memory(report)
@@ -196,7 +204,7 @@ class ExplorerAgent(BaseAgent):
         )
 
     def explore(self, instruction: str) -> ExplorerReport:
-        inventory, contents = self._scan()
+        inventory, contents, metrics = self._scan()
         snapshot = RepositorySnapshot(
             files=inventory.files,
             directories=inventory.directories,
@@ -218,9 +226,10 @@ class ExplorerAgent(BaseAgent):
             conventions=conventions,
             relevant_files=relevant,
             architecture_summary=summary,
+            exploration_metrics=metrics,
         )
 
-    def _scan(self) -> tuple[RepositoryInventory, dict[str, str]]:
+    def _scan(self) -> tuple[RepositoryInventory, dict[str, str], dict[str, object]]:
         files, directories = self._walk()
         language_detector = next(
             (item for item in self.detectors if isinstance(item, LanguageDetector)),
@@ -235,7 +244,73 @@ class ExplorerAgent(BaseAgent):
         ci_files = tuple(path for path in files if self._is_ci(path))
         entry_points = tuple(path for path in files if Path(path).name in ENTRY_POINT_NAMES)
         selected = tuple(dict.fromkeys((*configuration, *documentation, *scripts, *ci_files)))
-        contents = self._read_selected(selected)
+        current_fingerprints = {
+            path: self._metadata_fingerprint(path) for path in files
+        }
+        previous: dict[str, str] = {}
+        memory_context: Mapping[str, object] = {}
+        memory_valid = False
+        fallback_reason = "No existe memoria de exploración previa."
+        if self.project_memory is not None:
+            try:
+                memory_context = self.project_memory.exploration_context()
+                raw = memory_context.get("known_file_fingerprints", {})
+                if isinstance(raw, Mapping) and raw:
+                    previous = {
+                        str(path): str(value) for path, value in raw.items()
+                    }
+                    memory_valid = True
+                    fallback_reason = "Fingerprints previos disponibles."
+            except (MemoryCorruptionError, ProjectMemoryError, ValueError) as error:
+                fallback_reason = f"Memoria inválida; exploración completa: {error}"
+        if memory_valid:
+            hinted = tuple(
+                path
+                for key in ("known_important_files", "known_manifests")
+                for path in memory_context.get(key, ())
+                if isinstance(path, str) and path in files
+            )
+            selected = tuple(dict.fromkeys((*hinted, *selected)))
+        new_files = tuple(path for path in files if path not in previous)
+        modified_files = tuple(
+            path for path in files
+            if path in previous and previous[path] != current_fingerprints[path]
+        )
+        stable_selected = tuple(
+            path for path in selected
+            if path in previous and path not in modified_files
+        )
+        revalidated = stable_selected[:1] if memory_valid else ()
+        selected_to_read = (
+            selected if not memory_valid else
+            tuple(dict.fromkeys((
+                *(path for path in selected if path in new_files or path in modified_files),
+                *revalidated,
+            )))
+        )
+        contents = self._read_selected(selected_to_read)
+        avoided = tuple(path for path in stable_selected if path not in revalidated)
+        strategy = "incremental" if memory_valid else "full"
+        metrics: dict[str, object] = {
+            "strategy": strategy,
+            "reason": fallback_reason,
+            "files_reused": stable_selected,
+            "files_avoided": avoided,
+            "files_revalidated": revalidated,
+            "files_new": new_files,
+            "files_modified": modified_files,
+            "files_inspected": tuple(contents),
+            "file_fingerprints": current_fingerprints,
+            "memory_hints": {
+                "known_architecture": memory_context.get("known_architecture", ""),
+                "known_important_files": tuple(memory_context.get("known_important_files", ())),
+                "known_technologies": tuple(memory_context.get("known_technologies", ())),
+                "known_commands": tuple(memory_context.get("known_commands", ())),
+                "known_modules": tuple(memory_context.get("known_modules", ())),
+                "known_manifests": tuple(memory_context.get("known_manifests", ())),
+                "last_explored_at": memory_context.get("last_explored_at"),
+            } if memory_valid else {},
+        }
         inventory = RepositoryInventory(
             files=files,
             directories=directories,
@@ -248,7 +323,11 @@ class ExplorerAgent(BaseAgent):
             entry_points=entry_points,
             files_inspected=tuple(contents),
         )
-        return inventory, contents
+        return inventory, contents, metrics
+
+    def _metadata_fingerprint(self, relative: str) -> str:
+        stat = (self.repository_root / relative).stat()
+        return f"{stat.st_size}:{stat.st_mtime_ns}"
 
     def _walk(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
         files: list[str] = []
@@ -362,6 +441,53 @@ class ExplorerAgent(BaseAgent):
         if self.profile.search_tags:
             state.add_observation("Tags de búsqueda usados: " + ", ".join(self.profile.search_tags))
 
+    def _record_exploration_strategy(
+        self, report: ExplorerReport, state: TaskState
+    ) -> None:
+        metrics = report.exploration_metrics
+        strategy = str(metrics.get("strategy", "full"))
+        state.add_observation(f"Memoria de exploración consultada: {self.project_memory is not None}.")
+        state.add_observation(
+            f"Estrategia de exploración: {strategy}; motivo: {metrics.get('reason', '')}"
+        )
+        labels = (
+            ("Elementos reutilizados", "files_reused"),
+            ("Archivos evitados", "files_avoided"),
+            ("Archivos revalidados", "files_revalidated"),
+            ("Archivos nuevos", "files_new"),
+            ("Archivos modificados desde memoria", "files_modified"),
+        )
+        for label, key in labels:
+            values = tuple(metrics.get(key, ()))
+            state.add_observation(f"{label}: {', '.join(values) if values else 'ninguno'}.")
+        hints = metrics.get("memory_hints", {})
+        if isinstance(hints, Mapping) and hints:
+            state.add_observation(
+                "Memoria reutilizada como pista validada parcialmente: "
+                f"arquitectura={bool(hints.get('known_architecture'))}; "
+                f"archivos_importantes={len(tuple(hints.get('known_important_files', ())))}; "
+                f"tecnologías={len(tuple(hints.get('known_technologies', ())))}; "
+                f"comandos={len(tuple(hints.get('known_commands', ())))}."
+            )
+        emit_observation(
+            self.observability,
+            ObservabilityEvent(
+                "agent", "explorer-strategy", agent=self.name,
+                payload={
+                    "strategy": strategy,
+                    "reason": metrics.get("reason"),
+                    "files_avoided": len(tuple(metrics.get("files_avoided", ()))),
+                    "files_inspected": len(tuple(metrics.get("files_inspected", ()))),
+                    "files_revalidated": tuple(metrics.get("files_revalidated", ())),
+                    "files_new": tuple(metrics.get("files_new", ())),
+                    "files_modified": tuple(metrics.get("files_modified", ())),
+                    "memory_invalidated": str(metrics.get("reason", "")).startswith(
+                        "Memoria inválida"
+                    ),
+                },
+            ),
+        )
+
     @staticmethod
     def _summarize(
         inventory: RepositoryInventory, detections: Sequence[RepositoryDetection]
@@ -412,7 +538,10 @@ class ExplorerAgent(BaseAgent):
     def _record_memory(self, report: ExplorerReport) -> None:
         if self.project_memory is None:
             return
-        self.project_memory.load()
+        try:
+            self.project_memory.load()
+        except MemoryCorruptionError:
+            return
         self.project_memory.update_project_summary(report.architecture_summary)
         self.project_memory.update_architecture(report.architecture_summary)
         for directory in report.inventory.directories:
@@ -432,6 +561,12 @@ class ExplorerAgent(BaseAgent):
                 self.project_memory.add_known_command(command, evidence)
         for convention in report.conventions:
             self.project_memory.add_convention(convention.name)
+        self.project_memory.record_exploration(
+            file_fingerprints=dict(
+                report.exploration_metrics.get("file_fingerprints", {})
+            ),
+            manifests=report.inventory.configuration_files,
+        )
         self.project_memory.save()
 
     @staticmethod

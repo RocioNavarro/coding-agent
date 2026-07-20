@@ -26,6 +26,11 @@ from core.observability import (
     NoOpObservabilityClient, ObservabilityClient, ObservabilityEvent,
     emit_observation, observation_context,
 )
+from core.progress import ProgressAssessment
+from core.planned_operations import (
+    PlannedOperation, PlannedOperationProvider, PolicyPreflight,
+    StructuredPlannedOperationProvider,
+)
 
 
 TaskKind = Literal["analysis", "change"]
@@ -33,6 +38,7 @@ OrchestrationStatus = Literal[
     "completed", "rejected", "blocked", "max_iterations"
 ]
 PlanReviewer = Callable[[str], PlanReview]
+OperationApprover = Callable[[PlannedOperation], bool]
 
 
 @dataclass(frozen=True)
@@ -234,6 +240,11 @@ class MainAgent:
         minimum_evidence_confidence: float = 0.5,
         observability: ObservabilityClient | None = None,
         profile: ProjectProfile | None = None,
+        review_analysis_tasks: bool = False,
+        operation_provider: PlannedOperationProvider | None = None,
+        policy_preflight: PolicyPreflight | None = None,
+        max_intent_attempts: int = 1,
+        use_propose_only_for_intent: bool = False,
     ) -> None:
         if max_iterations < 1:
             raise ValueError("max_iterations debe ser al menos 1.")
@@ -254,6 +265,17 @@ class MainAgent:
         self.observability = observability or NoOpObservabilityClient()
         self._task_started = 0.0
         self.profile = profile or ProjectProfile()
+        if not isinstance(review_analysis_tasks, bool):
+            raise ValueError("review_analysis_tasks debe ser booleano.")
+        self.review_analysis_tasks = review_analysis_tasks
+        if max_intent_attempts < 1:
+            raise ValueError("max_intent_attempts debe ser al menos 1.")
+        self.operation_provider = operation_provider or StructuredPlannedOperationProvider()
+        self.policy_preflight = policy_preflight
+        self.max_intent_attempts = max_intent_attempts
+        if not isinstance(use_propose_only_for_intent, bool):
+            raise ValueError("use_propose_only_for_intent debe ser booleano.")
+        self.use_propose_only_for_intent = use_propose_only_for_intent
 
     def run(
         self,
@@ -261,6 +283,7 @@ class MainAgent:
         review_plan: PlanReviewer,
         *,
         task_id: str | None = None,
+        approve_operation: OperationApprover | None = None,
     ) -> OrchestrationResult:
         state = TaskState.create(request, task_id=task_id)
         self._task_started = perf_counter()
@@ -278,7 +301,17 @@ class MainAgent:
         self._memory_available = True
         try:
             if self.project_memory is not None:
-                self.project_memory.load()
+                try:
+                    self.project_memory.load()
+                    state.add_observation("Memoria persistente consultada antes de Explorer.")
+                except MemoryCorruptionError as error:
+                    self._memory_available = False
+                    state.record_error(
+                        ErrorRecord(str(error), "exploration", "project_memory", True)
+                    )
+                    state.add_warning(
+                        "Memoria inválida; se continúa con exploración completa."
+                    )
             state.set_status("running")
             state.set_phase("analysis")
             analysis = self.task_analyzer.analyze(request)
@@ -340,9 +373,30 @@ class MainAgent:
                 state.approve_plan(plan)
 
                 if analysis.kind == "analysis":
+                    analysis_summary = self._analysis_summary(state)
+                    if self.review_analysis_tasks:
+                        if self.reviewer is None:
+                            return self._blocked(
+                                state, selected, iteration,
+                                "Reviewer no está configurado para revisar el análisis.",
+                            )
+                        state.set_phase("review")
+                        state.set_final_result(analysis_summary)
+                        with observation_context(
+                            task_id=state.task_id,
+                            parent_event_id=f"{state.task_id}:reviewer:{iteration}",
+                            agent="reviewer",
+                        ):
+                            review = self.reviewer.run(
+                                "Revisar el resultado del análisis", state
+                            )
+                        selected.append("reviewer")
+                        self._record_agent(state, "reviewer", iteration)
+                        if review.decision != "approved":
+                            return self._blocked(state, selected, iteration, review.summary)
                     state.set_status("completed")
                     state.set_phase("finalization")
-                    state.set_final_result(self._analysis_summary(state))
+                    state.set_final_result(analysis_summary)
                     return self._result("completed", state, iteration, selected)
 
                 if self.implementer is None:
@@ -350,15 +404,19 @@ class MainAgent:
                         state, selected, iteration, "Implementer no está configurado."
                     )
 
+                if self.policy_preflight is not None:
+                    blocked = self._run_policy_preflight(
+                        state, selected, iteration, approve_operation
+                    )
+                    if blocked is not None:
+                        return blocked
+
                 state.set_phase("evidence_assessment")
                 with observation_context(
                     task_id=state.task_id,
                     parent_event_id=f"task:{state.task_id}", agent="main",
                 ):
-                    assessment = self.implementer.assess_evidence(
-                        request, state, validation_available=self.tester is not None
-                    )
-                state.record_evidence_assessment(assessment)
+                    assessment = self._assess_evidence(request, state)
                 if assessment.status == "partial":
                     missing_evidence = set(assessment.missing_information)
                     if missing_evidence & {
@@ -389,10 +447,7 @@ class MainAgent:
                         task_id=state.task_id,
                         parent_event_id=f"task:{state.task_id}", agent="main",
                     ):
-                        assessment = self.implementer.assess_evidence(
-                            request, state, validation_available=self.tester is not None
-                        )
-                    state.record_evidence_assessment(assessment)
+                        assessment = self._assess_evidence(request, state)
                 if assessment.status != "sufficient":
                     return self._blocked(
                         state, selected, iteration,
@@ -442,6 +497,22 @@ class MainAgent:
                 selected.append("tester")
                 self._record_agent(state, "tester", iteration)
 
+                progress = self._progress_recommendation(testing)
+                if progress is not None:
+                    state.add_observation(
+                        "ProgressMonitor recomendó "
+                        f"{progress.recommendation}: {progress.reason}"
+                    )
+                    if progress.recommendation in {"stop", "ask_user"}:
+                        return self._blocked(
+                            state, selected, iteration,
+                            progress.reason or "ProgressMonitor detuvo la ejecución.",
+                        )
+                    feedback = (
+                        progress.reason
+                        or "Cambiar la estrategia de validación antes de reintentar.",
+                    )
+
                 state.set_phase("review")
                 assert self.reviewer is not None
                 with observation_context(
@@ -464,7 +535,11 @@ class MainAgent:
                 if review.decision in {"blocked", "insufficient_evidence"}:
                     return self._blocked(state, selected, iteration, review.summary)
 
-                feedback = tuple(review.required_changes) or (review.summary,)
+                feedback = (
+                    feedback
+                    or tuple(review.required_changes)
+                    or (review.summary,)
+                )
                 if testing.status == "failed":
                     feedback = (*feedback, testing.summary)
                 state.add_observation("Reviewer solicitó replanificar el trabajo.")
@@ -499,6 +574,155 @@ class MainAgent:
             return self._blocked(
                 state, selected, 0, f"La coordinación no pudo continuar: {error}"
             )
+
+    def _run_policy_preflight(
+        self,
+        state: TaskState,
+        selected: Sequence[str],
+        iteration: int,
+        approve_operation: OperationApprover | None,
+    ) -> OrchestrationResult | None:
+        assert state.approved_plan is not None
+        explorer_results = tuple(
+            result for result in state.subagent_results if result.subagent_id == "explorer"
+        )
+        intent = self.operation_provider.provide(
+            state.approved_plan, state, explorer_results, None
+        )
+        if (
+            self.use_propose_only_for_intent
+            and (intent.sensitive_unstructured or not intent.operations)
+        ):
+            assert self.implementer is not None
+            proposal = None
+            for _ in range(self.max_intent_attempts):
+                proposal = self.implementer.run(
+                    state.original_request, state, mode="propose_only"
+                )
+                intent = self.operation_provider.provide(
+                    state.approved_plan, state, explorer_results, proposal
+                )
+                if intent.operations and not intent.sensitive_unstructured:
+                    break
+        state.record_planned_operations(
+            operation.to_dict() for operation in intent.operations
+        )
+        preflight = self.policy_preflight.evaluate(
+            intent, approved_fingerprints=state.policy_approvals
+        )
+        state.record_policy_preflight(
+            decision.to_dict() for decision in preflight.decisions
+        )
+        self._observe_preflight(state, intent, preflight)
+        if preflight.outcome == "insufficient_structured_intent":
+            return self._blocked(
+                state, selected, iteration,
+                json.dumps(
+                    {"status": preflight.outcome,
+                     "missing_information": list(preflight.missing_information),
+                     "recommended_action": preflight.recommended_action},
+                    ensure_ascii=False,
+                ),
+            )
+        if preflight.outcome == "deny":
+            return self._blocked(
+                state, selected, iteration,
+                json.dumps(
+                    {"status": "denied", "decisions": [
+                        decision.to_dict() for decision in preflight.decisions
+                        if decision.outcome == "deny"
+                    ], "recommended_action": "stop"},
+                    ensure_ascii=False,
+                ),
+            )
+        if preflight.outcome == "require_approval":
+            if approve_operation is None:
+                return self._blocked(
+                    state, selected, iteration,
+                    json.dumps(
+                        {"status": "approval_required",
+                         "recommended_action": "request_approval"},
+                        ensure_ascii=False,
+                    ),
+                )
+            by_fingerprint = {item.fingerprint: item for item in intent.operations}
+            for decision in preflight.decisions:
+                if decision.outcome != "require_approval":
+                    continue
+                operation = by_fingerprint[decision.fingerprint]
+                if not approve_operation(operation):
+                    return self._blocked(
+                        state, selected, iteration,
+                        "La operación planificada no fue aprobada.",
+                    )
+                state.record_policy_approval(operation.fingerprint)
+            approved = self.policy_preflight.evaluate(
+                intent, approved_fingerprints=state.policy_approvals
+            )
+            state.record_policy_preflight(
+                decision.to_dict() for decision in approved.decisions
+            )
+            self._observe_preflight(state, intent, approved)
+            if approved.outcome != "allow":
+                return self._blocked(
+                    state, selected, iteration,
+                    "La aprobación no coincide con la operación vigente.",
+                )
+        return None
+
+    def _observe_preflight(self, state, intent, preflight) -> None:
+        emit_observation(
+            self.observability,
+            ObservabilityEvent(
+                "tool", "policy-preflight", task_id=state.task_id,
+                parent_event_id=f"task:{state.task_id}", agent="main",
+                payload={
+                    "phase": "policy_preflight",
+                    "outcome": preflight.outcome,
+                    "operations": [item.to_dict() for item in intent.operations],
+                    "decisions": [item.to_dict() for item in preflight.decisions],
+                    "approval_required": preflight.outcome == "require_approval",
+                    "missing_information": preflight.missing_information,
+                },
+            ),
+        )
+
+    def _assess_evidence(
+        self, request: str, state: TaskState
+    ) -> EvidenceAssessment:
+        assert self.implementer is not None
+        assessment = self.implementer.assess_evidence(
+            request, state, validation_available=self.tester is not None
+        )
+        state.record_evidence_assessment(assessment)
+        emit_observation(
+            self.observability,
+            ObservabilityEvent(
+                "agent", "evidence-sufficiency-policy",
+                task_id=state.task_id,
+                parent_event_id=f"task:{state.task_id}",
+                agent="main",
+                payload={
+                    "status": assessment.status,
+                    "blockers": assessment.risks,
+                    "missing_information": assessment.missing_information,
+                    "risks": assessment.risks,
+                    "recommended_action": assessment.recommended_action,
+                    "confidence": assessment.confidence,
+                    "task_id": state.task_id,
+                    "plan": state.approved_plan,
+                },
+            ),
+        )
+        return assessment
+
+    @staticmethod
+    def _progress_recommendation(testing: TesterResult) -> ProgressAssessment | None:
+        assessments = getattr(testing, "progress_assessments", ())
+        return next(
+            (assessment for assessment in reversed(assessments) if assessment.detected),
+            None,
+        )
 
     @staticmethod
     def _analysis_summary(state: TaskState) -> str:

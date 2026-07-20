@@ -14,10 +14,15 @@ from typing import Literal, Sequence
 from agents.base import AgentContext, BaseAgent
 from core.llm_client import LLMClient
 from core.profiles import ProjectProfile
+from core.progress import ProgressAssessment, ProgressMonitor
 from core.settings import AgentSettings
 from core.task_state import SubagentResult, TaskState, ToolExecutionRecord
+from core.observability import (
+    NoOpObservabilityClient, ObservabilityClient, ObservabilityEvent,
+    emit_observation,
+)
 from security.command_policy import CommandPolicyError, validate_command
-from security.policy_engine import PolicyContext, PolicyEngine
+from security.policy_engine import PolicyContext, PolicyDecision, PolicyEngine
 from tools.registry import ToolRegistry
 
 
@@ -96,6 +101,7 @@ class TesterResult:
     modified_files: tuple[str, ...]
     summary: str
     subagent_result: SubagentResult
+    progress_assessments: tuple[ProgressAssessment, ...] = ()
 
 
 class ValidationCommandProvider(ABC):
@@ -264,6 +270,8 @@ class TesterAgent(BaseAgent):
         profile: ProjectProfile | None = None,
         policy_engine: PolicyEngine | None = None,
         policy_context: PolicyContext | None = None,
+        progress_monitor: ProgressMonitor | None = None,
+        observability: ObservabilityClient | None = None,
     ) -> None:
         super().__init__(
             name=name,
@@ -278,6 +286,10 @@ class TesterAgent(BaseAgent):
         self.safety_policy = safety_policy or ValidationSafetyPolicy(repository_root)
         self.profile = profile or ProjectProfile()
         self.policy_engine = policy_engine or PolicyEngine()
+        self.observability = observability or NoOpObservabilityClient()
+        self.progress_monitor = progress_monitor or ProgressMonitor(
+            observability=self.observability
+        )
         self.policy_context = policy_context or PolicyContext(
             agent=name,
             workspace=Path(repository_root),
@@ -315,10 +327,22 @@ class TesterAgent(BaseAgent):
                 instruction,
             )
 
-        records = tuple(self._execute(command, task_state, index) for index, command in enumerate(selected, 1))
+        executions = tuple(
+            self._execute(command, task_state, index)
+            for index, command in enumerate(selected, 1)
+        )
+        records = tuple(record for record, _ in executions)
+        progress = tuple(
+            assessment
+            for _, assessments in executions
+            for assessment in assessments
+        )
         status = self._overall_status(records)
         summary = self._summary(status, records)
-        return self._finish(task_state, status, records, modified, summary, instruction)
+        return self._finish(
+            task_state, status, records, modified, summary, instruction,
+            progress_assessments=progress,
+        )
 
     def _profile_commands(
         self, discovered: Sequence[ValidationCommand], state: TaskState
@@ -375,7 +399,7 @@ class TesterAgent(BaseAgent):
 
     def _execute(
         self, command: ValidationCommand, state: TaskState, index: int
-    ) -> ValidationRecord:
+    ) -> tuple[ValidationRecord, tuple[ProgressAssessment, ...]]:
         decision = self.policy_engine.evaluate(
             "run_command", {"command": command.command}, self.policy_context,
             modifies_system=False,
@@ -390,7 +414,8 @@ class TesterAgent(BaseAgent):
                 f"{decision.outcome}; {decision.reason}"
             )
             self._record_state(state, record, index)
-            return record
+            self._record_policy_decision(command, decision, record)
+            return record, ()
         allowed, reason = self.safety_policy.validate(command.command)
         if not allowed:
             record = ValidationRecord(
@@ -398,13 +423,29 @@ class TesterAgent(BaseAgent):
                 None, 0.0, reason, "blocked", 0
             )
             self._record_state(state, record, index)
-            return record
+            self._record_policy_decision(command, decision, record)
+            return record, ()
 
         outcome: CommandOutcome | None = None
         attempts = 0
+        progress: list[ProgressAssessment] = []
         for attempts in range(1, self.limits.max_retries + 2):
             outcome = self.executor.execute(
                 command.command, timeout_seconds=self.limits.timeout_seconds
+            )
+            progress.append(
+                self.progress_monitor.record_tool_call(
+                    self.name,
+                    "run_command",
+                    {"command": command.command, "origin": command.origin},
+                    self._progress_result(outcome),
+                    justification=command.evidence,
+                )
+            )
+            progress.append(
+                self.progress_monitor.record_iteration(
+                    evidence=(self._progress_evidence(command.command, outcome),)
+                )
             )
             if outcome.exit_code == 0 or outcome.timed_out or outcome.unavailable:
                 break
@@ -426,7 +467,63 @@ class TesterAgent(BaseAgent):
                 f"Comando sugerido ejecutado: {command.command}; origen: project_profile."
             )
         self._record_state(state, record, index)
-        return record
+        self._record_policy_decision(command, decision, record)
+        return record, tuple(progress)
+
+    @staticmethod
+    def _progress_result(outcome: CommandOutcome) -> dict[str, object]:
+        success = outcome.exit_code == 0 and not outcome.timed_out and not outcome.unavailable
+        error = outcome.stderr or (
+            "timeout" if outcome.timed_out else
+            "command unavailable" if outcome.unavailable else
+            f"exit_code={outcome.exit_code}"
+        )
+        return {
+            "success": success,
+            "result": {
+                "exit_code": outcome.exit_code,
+                "stdout": outcome.stdout,
+                "stderr": outcome.stderr,
+            },
+            "error": None if success else error,
+        }
+
+    @staticmethod
+    def _progress_evidence(command: str, outcome: CommandOutcome) -> str:
+        return "|".join(
+            (
+                command,
+                str(outcome.exit_code),
+                outcome.stdout,
+                outcome.stderr,
+                str(outcome.timed_out),
+                str(outcome.unavailable),
+            )
+        )
+
+    def _record_policy_decision(
+        self,
+        command: ValidationCommand,
+        decision: PolicyDecision,
+        record: ValidationRecord,
+    ) -> None:
+        emit_observation(
+            self.observability,
+            ObservabilityEvent(
+                "tool", "tester-policy-decision", agent=self.name,
+                payload={
+                    "tool": "run_command",
+                    "command": command.command,
+                    "origin": command.origin,
+                    "decision": decision.outcome,
+                    "reason": decision.reason,
+                    "approval_required": decision.outcome == "require_approval",
+                    "result": record.status,
+                    "exit_code": record.exit_code,
+                },
+                latency_ms=record.duration_ms,
+            ),
+        )
 
     def _record_state(self, state: TaskState, record: ValidationRecord, index: int) -> None:
         state.record_tool_call(
@@ -482,6 +579,8 @@ class TesterAgent(BaseAgent):
         modified: Sequence[str],
         summary: str,
         instruction: str,
+        *,
+        progress_assessments: Sequence[ProgressAssessment] = (),
     ) -> TesterResult:
         result = SubagentResult(
             self.name,
@@ -499,4 +598,7 @@ class TesterAgent(BaseAgent):
         )
         state.add_subagent_result(result)
         state.add_observation(summary)
-        return TesterResult(status, tuple(records), tuple(modified), summary, result)
+        return TesterResult(
+            status, tuple(records), tuple(modified), summary, result,
+            tuple(progress_assessments),
+        )

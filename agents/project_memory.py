@@ -64,6 +64,9 @@ def _empty_data(workspace: str, workspace_id: str) -> dict[str, Any]:
         "previous_tasks": [],
         "modified_files": [],
         "session_summaries": [],
+        "known_manifests": [],
+        "file_fingerprints": {},
+        "last_explored_at": None,
         "updated_at": None,
     }
 
@@ -77,6 +80,7 @@ class ProjectMemory(ProjectMemoryProvider):
             "known_commands", "conventions", "decisions", "bugs",
             "frequent_errors", "previous_tasks", "modified_files",
             "session_summaries",
+            "known_manifests",
         }
     )
 
@@ -94,7 +98,10 @@ class ProjectMemory(ProjectMemoryProvider):
         self.workspace = root
         canonical = root.as_posix()
         stable_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
-        self.workspace_id = self._safe_identifier(identifier) if identifier else stable_hash
+        self.workspace_id = (
+            f"{self._safe_identifier(identifier)}-{stable_hash}"
+            if identifier else stable_hash
+        )
         base = Path(storage_root).resolve() if storage_root else root / ".coding-agent" / "memory"
         self.storage_root = base
         self.path = base / f"{self.workspace_id}.json"
@@ -281,6 +288,39 @@ class ProjectMemory(ProjectMemoryProvider):
     def add_convention(self, convention: str) -> None:
         self._append_unique("conventions", convention)
 
+    def record_exploration(
+        self,
+        *,
+        file_fingerprints: Mapping[str, str],
+        manifests: Sequence[str] = (),
+    ) -> None:
+        if not isinstance(file_fingerprints, Mapping) or not all(
+            isinstance(path, str) and isinstance(value, str)
+            for path, value in file_fingerprints.items()
+        ):
+            raise ValueError("file_fingerprints debe mapear rutas a fingerprints.")
+        self._data["file_fingerprints"] = self._sanitize(dict(file_fingerprints))
+        self._data["known_manifests"] = []
+        for path in manifests:
+            self._append_unique("known_manifests", path, path=True)
+        self._data["last_explored_at"] = datetime.now(timezone.utc).isoformat()
+
+    def exploration_context(self) -> dict[str, Any]:
+        if not self._loaded:
+            self.load()
+        return deepcopy(
+            {
+                "known_architecture": self._data["architecture"],
+                "known_important_files": self._data["important_files"],
+                "known_technologies": self._data["technologies"],
+                "known_commands": self._data["known_commands"],
+                "known_modules": self._data["modules"],
+                "known_manifests": self._data["known_manifests"],
+                "last_explored_at": self._data["last_explored_at"],
+                "known_file_fingerprints": self._data["file_fingerprints"],
+            }
+        )
+
     def _set_text(self, field: str, value: str) -> None:
         self._data[field] = self._safe_text(value)
 
@@ -351,3 +391,10 @@ class ProjectMemory(ProjectMemoryProvider):
                 raise ValueError(f"{field} debe ser texto")
         if data["updated_at"] is not None and not isinstance(data["updated_at"], str):
             raise ValueError("updated_at debe ser texto o null")
+        if data["last_explored_at"] is not None and not isinstance(data["last_explored_at"], str):
+            raise ValueError("last_explored_at debe ser texto o null")
+        if not isinstance(data["file_fingerprints"], dict) or not all(
+            isinstance(path, str) and isinstance(value, str)
+            for path, value in data["file_fingerprints"].items()
+        ):
+            raise ValueError("file_fingerprints debe ser un objeto de textos")
