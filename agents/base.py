@@ -93,6 +93,9 @@ class BaseAgent(ABC):
     _MAX_OUTPUT_ATTEMPTS = 2
     """Reintentos ante salida mal formada del LLM (no ante políticas rechazadas)."""
 
+    _MAX_TOOL_ROUNDS = 3
+    """Rondas de tool calling ejecutadas antes de forzar una respuesta sin tools."""
+
     def __init__(
         self,
         *,
@@ -164,9 +167,8 @@ class BaseAgent(ABC):
         tools = available_tools or ToolRegistry()
 
         with self._error_guard(task_state):
-            schemas = self._allowed_schemas(tools)
             result = self._complete_and_parse(
-                agent_input, schemas,
+                agent_input, tools,
                 lambda response: self.validate_tool_calls(response.tool_calls, tools),
             )
 
@@ -178,21 +180,20 @@ class BaseAgent(ABC):
     def _complete_and_parse(
         self,
         agent_input: AgentInput,
-        schemas: Sequence[dict[str, Any]],
+        tools: ToolRegistry,
         validate: Callable[[LLMResponse], None],
     ) -> SubagentResult:
-        """Reintenta sólo cuando la respuesta del LLM no se puede normalizar.
+        """Reintenta sólo cuando la respuesta final del LLM no se puede normalizar.
 
-        ``validate`` corre antes de cada intento de parseo y puede rechazar la
-        respuesta (ej. tool call no permitida) sin reintentar: ese tipo de rechazo
-        es determinista y volvería a fallar igual. Sólo se reintenta cuando
+        ``validate`` corre sobre la respuesta final (ya sin tool calls pendientes)
+        y puede rechazarla —ej. una tool no permitida— sin reintentar: ese tipo de
+        rechazo es determinista y volvería a fallar igual. Sólo se reintenta cuando
         ``to_subagent_result`` falla por una salida mal formada del LLM.
         """
+        schemas = self._allowed_schemas(tools)
         last_error: AgentExecutionError | None = None
         for _ in range(self._MAX_OUTPUT_ATTEMPTS):
-            response = self.llm_client.complete(
-                self.build_context(agent_input), schemas
-            )
+            response = self._complete_until_text(agent_input, schemas, tools)
             validate(response)
             try:
                 return self.to_subagent_result(agent_input, response)
@@ -200,6 +201,38 @@ class BaseAgent(ABC):
                 last_error = error
         assert last_error is not None
         raise last_error
+
+    def _complete_until_text(
+        self,
+        agent_input: AgentInput,
+        schemas: Sequence[dict[str, Any]],
+        tools: ToolRegistry,
+    ) -> LLMResponse:
+        """Ejecuta las tool calls que pida el LLM hasta obtener una respuesta de texto.
+
+        Antes, el LLM podía pedir una tool (autorizada por el prompt) que nunca se
+        ejecutaba: la respuesta quedaba sin texto y ``to_subagent_result`` fallaba
+        siempre. Ahora se ejecuta cada tool call —ya validada y confinada por
+        ``allowed_tools``— y se le devuelve el resultado al modelo, acotado a
+        ``_MAX_TOOL_ROUNDS`` rondas antes de forzar una respuesta final sin tools.
+        """
+        messages = self.build_context(agent_input)
+        for _ in range(self._MAX_TOOL_ROUNDS):
+            response = self.llm_client.complete(messages, schemas)
+            if not response.tool_calls:
+                return response
+            self.validate_tool_calls(response.tool_calls, tools)
+            messages = [*messages, response.assistant_message]
+            for call in response.tool_calls:
+                execution = tools.execute(call.name, call.arguments)
+                messages.append(
+                    Message(
+                        role="tool",
+                        content=json.dumps(execution, ensure_ascii=False, default=str),
+                        tool_call_id=call.id,
+                    )
+                )
+        return self.llm_client.complete(messages, ())
 
     def build_context(self, agent_input: AgentInput) -> list[Message]:
         """Construye mensajes sólo con la entrada explícita de esta ejecución."""

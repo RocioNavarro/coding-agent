@@ -500,7 +500,9 @@ class ResearcherAgent(BaseAgent):
             if response.tool_calls:
                 raise AgentExecutionError("Researcher no puede solicitar tools.")
 
-        base_result = self._complete_and_parse(agent_input, (), _reject_tool_calls)
+        base_result = self._complete_and_parse(
+            agent_input, ToolRegistry(), _reject_tool_calls
+        )
         sources = tuple(fragment.to_source() for fragment in fragments)
         return SubagentResult(
             subagent_id=base_result.subagent_id,
