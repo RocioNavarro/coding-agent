@@ -496,10 +496,11 @@ class ResearcherAgent(BaseAgent):
                 ),
             ),
         )
-        response = self.llm_client.complete(self.build_context(agent_input), ())
-        if response.tool_calls:
-            raise AgentExecutionError("Researcher no puede solicitar tools.")
-        base_result = self.to_subagent_result(agent_input, response)
+        def _reject_tool_calls(response):
+            if response.tool_calls:
+                raise AgentExecutionError("Researcher no puede solicitar tools.")
+
+        base_result = self._complete_and_parse(agent_input, (), _reject_tool_calls)
         sources = tuple(fragment.to_source() for fragment in fragments)
         return SubagentResult(
             subagent_id=base_result.subagent_id,

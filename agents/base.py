@@ -6,7 +6,7 @@ import json
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from core.llm_client import LLMClient
 from core.models import LLMResponse, Message, ToolCall
@@ -82,11 +82,16 @@ class BaseAgent(ABC):
     _OUTPUT_INSTRUCTION = (
         "Respondé únicamente con un objeto JSON con estas claves: summary (string), "
         "findings (lista de strings), recommendations (lista de strings), sources "
-        "(lista de objetos con origin, reference y summary opcional), files_relevant "
-        "(lista de strings), blockers (lista de strings) y confidence (número de 0 a 1). "
-        "Si necesitás una tool, solicitala mediante tool calling. No asumas contexto "
-        "que no aparezca en la entrada."
+        "(lista de objetos con origin, reference y summary opcional; origin debe ser "
+        "exactamente uno de estos 5 valores literales, sin traducir ni parafrasear: "
+        "\"repository\", \"project_memory\", \"rag\", \"web\", \"inference\"), "
+        "files_relevant (lista de strings), blockers (lista de strings) y confidence "
+        "(número de 0 a 1). Si necesitás una tool, solicitala mediante tool calling. "
+        "No asumas contexto que no aparezca en la entrada."
     )
+
+    _MAX_OUTPUT_ATTEMPTS = 2
+    """Reintentos ante salida mal formada del LLM (no ante políticas rechazadas)."""
 
     def __init__(
         self,
@@ -160,16 +165,41 @@ class BaseAgent(ABC):
 
         with self._error_guard(task_state):
             schemas = self._allowed_schemas(tools)
-            response = self.llm_client.complete(
-                self.build_context(agent_input), schemas
+            result = self._complete_and_parse(
+                agent_input, schemas,
+                lambda response: self.validate_tool_calls(response.tool_calls, tools),
             )
-            self.validate_tool_calls(response.tool_calls, tools)
-            result = self.to_subagent_result(agent_input, response)
 
         task_state.add_subagent_result(result)
         for source in result.sources:
             task_state.add_source(source)
         return result
+
+    def _complete_and_parse(
+        self,
+        agent_input: AgentInput,
+        schemas: Sequence[dict[str, Any]],
+        validate: Callable[[LLMResponse], None],
+    ) -> SubagentResult:
+        """Reintenta sólo cuando la respuesta del LLM no se puede normalizar.
+
+        ``validate`` corre antes de cada intento de parseo y puede rechazar la
+        respuesta (ej. tool call no permitida) sin reintentar: ese tipo de rechazo
+        es determinista y volvería a fallar igual. Sólo se reintenta cuando
+        ``to_subagent_result`` falla por una salida mal formada del LLM.
+        """
+        last_error: AgentExecutionError | None = None
+        for _ in range(self._MAX_OUTPUT_ATTEMPTS):
+            response = self.llm_client.complete(
+                self.build_context(agent_input), schemas
+            )
+            validate(response)
+            try:
+                return self.to_subagent_result(agent_input, response)
+            except AgentExecutionError as error:
+                last_error = error
+        assert last_error is not None
+        raise last_error
 
     def build_context(self, agent_input: AgentInput) -> list[Message]:
         """Construye mensajes sólo con la entrada explícita de esta ejecución."""
