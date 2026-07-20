@@ -5,3 +5,4 @@ __pycache__/
 .pytest_cache/
 data/vector_store/
 data/project_memory/
+.idea/

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from agents.orchestrator import MainAgent, TaskAnalysis
 from agents.project_memory import ProjectMemory
-from core.models import PlanReview
+from core.models import EvidenceAssessment, PlanReview
 from core.task_state import SourceReference, SubagentResult, TaskState
 
 
@@ -31,7 +31,9 @@ class FakeExplorer:
 
     def run(self, instruction: str, state: TaskState, *args, **kwargs) -> SubagentResult:
         self.calls += 1
-        state.add_repository_finding("Arquitectura detectada; evidencia: src/app.txt.")
+        state.add_repository_finding(
+            "Arquitectura e impacto detectados; evidencia: src/app.txt."
+        )
         state.add_source(SourceReference("repository", "src/app.txt", "archivo relevante"))
         result = SubagentResult(
             "explorer", instruction, "completed", summary="Repositorio explorado.",
@@ -77,8 +79,26 @@ class FakeImplementationResult:
 
 
 class FakeImplementer:
-    def __init__(self) -> None:
+    def __init__(self, evidence_status: str = "sufficient") -> None:
         self.calls = 0
+        self.assessment_calls = 0
+        self.evidence_status = evidence_status
+
+    def assess_evidence(
+        self, instruction: str, state: TaskState, *, validation_available: bool
+    ) -> EvidenceAssessment:
+        self.assessment_calls += 1
+        if self.evidence_status == "sufficient":
+            return EvidenceAssessment("sufficient", ("src/app.txt",), (), (), "proceed", 1.0)
+        if self.evidence_status == "partial":
+            return EvidenceAssessment(
+                "partial", (), ("impacto del cambio",), (),
+                "gather_more_evidence", 0.5,
+            )
+        return EvidenceAssessment(
+            "insufficient", (), ("permisos de modificación",),
+            ("No hay permisos suficientes.",), "request_help", 1.0,
+        )
 
     def run(self, instruction: str, state: TaskState, *args, **kwargs) -> FakeImplementationResult:
         self.calls += 1
@@ -143,9 +163,10 @@ def build_agent(
     tester: FakeTester | None = None,
     reviewer: FakeReviewer | None = None,
     max_iterations: int = 3,
+    evidence_status: str = "sufficient",
 ) -> tuple[MainAgent, FakePlanner, FakeImplementer, FakeTester, FakeReviewer]:
     planner = FakePlanner()
-    implementer = FakeImplementer()
+    implementer = FakeImplementer(evidence_status)
     selected_tester = tester or FakeTester()
     selected_reviewer = reviewer or FakeReviewer()
     agent = MainAgent(
@@ -260,6 +281,31 @@ def test_stops_when_research_evidence_is_insufficient() -> None:
     assert planner.feedback == []
     assert implementer.calls == tester.calls == reviewer.calls == 0
     assert "evidencia técnica es insuficiente" in result.final_response
+
+
+def test_partial_evidence_reexplores_and_never_reaches_implementation() -> None:
+    agent, _, implementer, tester, reviewer = build_agent(evidence_status="partial")
+
+    result = agent.run("Modificar con evidencia parcial", approve)
+
+    assert result.status == "blocked"
+    assert implementer.assessment_calls == 2
+    assert implementer.calls == tester.calls == reviewer.calls == 0
+    assert result.task_state.evidence_assessment is not None
+    assert result.task_state.evidence_assessment.status == "partial"
+    assert "gather_more_evidence" in result.final_response
+
+
+def test_insufficient_evidence_preserves_structured_blockers() -> None:
+    agent, _, implementer, tester, reviewer = build_agent(evidence_status="insufficient")
+
+    result = agent.run("Modificar sin permisos", approve)
+
+    assert result.status == "blocked"
+    assert implementer.calls == tester.calls == reviewer.calls == 0
+    assert result.task_state.files_modified == ()
+    assert '"missing_information": ["permisos de modificación"]' in result.final_response
+    assert '"recommended_action": "request_help"' in result.final_response
 
 
 def test_main_agent_loads_memory_and_persists_session_summary(tmp_path) -> None:

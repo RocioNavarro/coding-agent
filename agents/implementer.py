@@ -13,6 +13,8 @@ from agents.base import AgentContext, AgentExecutionError, AgentInput, BaseAgent
 from agents.context_manager import ContextManager, StateContextManager
 from core.llm_client import LLMClient
 from core.task_state import ErrorRecord, SourceReference, SubagentResult, TaskState
+from core.models import EvidenceAssessment
+from security.evidence_policy import EvidenceContext, EvidenceSufficiencyPolicy
 from tools.registry import ToolRegistry
 
 
@@ -150,6 +152,7 @@ class ImplementerAgent(BaseAgent):
         write_policy: WritePolicy,
         context_manager: ContextManager | None = None,
         minimum_evidence_confidence: float = 0.5,
+        evidence_policy: EvidenceSufficiencyPolicy | None = None,
         name: str = "implementer",
     ) -> None:
         super().__init__(
@@ -164,6 +167,7 @@ class ImplementerAgent(BaseAgent):
         self.write_policy = write_policy
         self.context_manager = context_manager or StateContextManager()
         self.minimum_evidence_confidence = minimum_evidence_confidence
+        self.evidence_policy = evidence_policy or EvidenceSufficiencyPolicy()
 
     def specialization_prompt(self) -> str:
         return "No produzcas código fuera de los fragmentos y archivos autorizados."
@@ -180,7 +184,7 @@ class ImplementerAgent(BaseAgent):
         if mode not in {"propose_only", "apply_changes"}:
             raise ValueError("mode debe ser propose_only o apply_changes.")
         try:
-            self._verify_preconditions(task_state)
+            self._verify_preconditions(task_state, mode)
             selected = self.context_manager.select(instruction, task_state, context)
             if not selected.files:
                 raise ImplementerBlockedError(
@@ -233,9 +237,79 @@ class ImplementerAgent(BaseAgent):
             subagent_result=subagent_result,
         )
 
-    def _verify_preconditions(self, state: TaskState) -> None:
+    def assess_evidence(
+        self,
+        instruction: str,
+        state: TaskState,
+        *,
+        validation_available: bool,
+    ) -> EvidenceAssessment:
+        """Recolecta hechos disponibles y delega la clasificación a la política."""
+        selected = self.context_manager.select(instruction, state)
+        targets = selected.files
+        existing: list[str] = []
+        policy_risks: list[str] = []
+        permissions_granted = bool(targets)
+        for path in targets:
+            decision = self.write_policy.evaluate(path, targets)
+            if not decision.allowed:
+                permissions_granted = False
+                policy_risks.append(decision.reason)
+            try:
+                if self.write_policy.resolve(path).is_file():
+                    existing.append(path)
+            except ValueError as error:
+                permissions_granted = False
+                policy_risks.append(str(error))
+
+        evidence_text = tuple(
+            filter(
+                None,
+                (
+                    *state.repository_findings,
+                    *(result.summary for result in state.subagent_results),
+                    *(item for result in state.subagent_results for item in result.findings),
+                    *(item for result in state.subagent_results for item in result.blockers),
+                    *state.warnings,
+                ),
+            )
+        )
+        lowered = tuple((item, item.casefold()) for item in evidence_text)
+        conventions = tuple(
+            item for item, text in lowered
+            if any(marker in text for marker in ("convención", "convention", "arquitectura"))
+        )
+        impacts = tuple(item for item, text in lowered if "impact" in text)
+        ambiguities = tuple(item for item, text in lowered if "ambig" in text)
+        contradictions = tuple(item for item, text in lowered if "contradic" in text)
+        detected_risks = tuple(item for item, text in lowered if "riesgo" in text)
+        excessive = any("excesiv" in item.casefold() for item in detected_risks)
+        context = EvidenceContext(
+            component=", ".join(targets),
+            expected_behavior="\n".join(
+                filter(None, (state.original_request, state.approved_plan or ""))
+            ),
+            conventions=conventions,
+            impact=impacts,
+            validation_methods=("Tester configurado",) if validation_available else (),
+            permissions_granted=permissions_granted,
+            target_files=targets,
+            existing_files=tuple(existing),
+            supporting_sources=tuple(source.reference for source in state.sources),
+            ambiguities=ambiguities,
+            contradictions=contradictions,
+            risks=(*detected_risks, *policy_risks),
+            risk_level="excessive" if excessive else "moderate" if detected_risks else "low",
+        )
+        return self.evidence_policy.evaluate(context)
+
+    def _verify_preconditions(self, state: TaskState, mode: ImplementationMode) -> None:
         if not state.approved_plan:
             raise ImplementerBlockedError("Implementer requiere un plan aprobado.")
+        if mode == "apply_changes" and not state.has_current_sufficient_evidence:
+            raise ImplementerBlockedError(
+                "Implementer requiere un EvidenceAssessment sufficient vigente."
+            )
         research_results = tuple(
             result for result in state.subagent_results if result.subagent_id == "researcher"
         )

@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal, Mapping
 from uuid import uuid4
 
-from core.models import ToolCall
+from core.models import EvidenceAssessment, ToolCall
 
 
 SourceOrigin = Literal["repository", "project_memory", "rag", "web", "inference"]
@@ -294,6 +294,8 @@ class TaskState:
     _errors: list[ErrorRecord] = field(default_factory=list, repr=False)
     _warnings: list[str] = field(default_factory=list, repr=False)
     _observations: list[str] = field(default_factory=list, repr=False)
+    _evidence_assessment: EvidenceAssessment | None = field(default=None, repr=False)
+    _evidence_assessment_plan: str | None = field(default=None, repr=False)
 
     DEFAULT_STATUS: ClassVar[str] = "pending"
     DEFAULT_PHASE: ClassVar[str] = "intake"
@@ -352,6 +354,18 @@ class TaskState:
     def observations(self) -> tuple[str, ...]:
         return tuple(self._observations)
 
+    @property
+    def evidence_assessment(self) -> EvidenceAssessment | None:
+        return self._evidence_assessment
+
+    @property
+    def has_current_sufficient_evidence(self) -> bool:
+        return (
+            self._evidence_assessment is not None
+            and self._evidence_assessment.status == "sufficient"
+            and self._evidence_assessment_plan == self.approved_plan
+        )
+
     def set_status(self, status: str) -> None:
         self.current_status = _required_text(status, "current_status")
 
@@ -360,6 +374,7 @@ class TaskState:
 
     def propose_plan(self, plan: str) -> None:
         self.proposed_plan = _required_text(plan, "proposed_plan")
+        self._invalidate_evidence_assessment()
 
     def approve_plan(self, plan: str | None = None) -> None:
         """Aprueba el plan indicado o, si se omite, el último plan propuesto."""
@@ -367,6 +382,20 @@ class TaskState:
         if selected_plan is None:
             raise ValueError("No hay un plan propuesto para aprobar.")
         self.approved_plan = _required_text(selected_plan, "approved_plan")
+        self._invalidate_evidence_assessment()
+
+    def record_evidence_assessment(self, assessment: EvidenceAssessment) -> None:
+        """Registra la evaluación y el plan exacto para el cual sigue vigente."""
+        if not isinstance(assessment, EvidenceAssessment):
+            raise TypeError("assessment debe ser EvidenceAssessment.")
+        if self.approved_plan is None:
+            raise ValueError("No se puede evaluar evidencia sin un plan aprobado.")
+        self._evidence_assessment = assessment
+        self._evidence_assessment_plan = self.approved_plan
+
+    def _invalidate_evidence_assessment(self) -> None:
+        self._evidence_assessment = None
+        self._evidence_assessment_plan = None
 
     def add_subagent_result(self, result: SubagentResult) -> None:
         if not isinstance(result, SubagentResult):
@@ -434,6 +463,11 @@ class TaskState:
             "errors": [item.to_dict() for item in self._errors],
             "warnings": list(self._warnings),
             "observations": list(self._observations),
+            "evidence_assessment": (
+                self._evidence_assessment.to_dict()
+                if self._evidence_assessment is not None else None
+            ),
+            "evidence_assessment_plan": self._evidence_assessment_plan,
             "final_result": self.final_result,
         }
 
@@ -489,6 +523,14 @@ class TaskState:
         )
         state._warnings.extend(cls._required_text_list(values, "warnings"))
         state._observations.extend(cls._required_text_list(values, "observations"))
+        raw_assessment = values.get("evidence_assessment")
+        if raw_assessment is not None:
+            if not isinstance(raw_assessment, dict):
+                raise ValueError("evidence_assessment debe ser un objeto.")
+            state._evidence_assessment = EvidenceAssessment.from_dict(raw_assessment)
+            state._evidence_assessment_plan = _optional_text(
+                values.get("evidence_assessment_plan"), "evidence_assessment_plan"
+            )
         return state
 
     @classmethod

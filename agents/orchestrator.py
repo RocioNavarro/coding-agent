@@ -18,7 +18,7 @@ from agents.researcher import ResearcherResult
 from agents.reviewer import ReviewerResult
 from agents.tester import TesterResult
 from core.llm_client import LLMClient
-from core.models import Message, PlanReview
+from core.models import EvidenceAssessment, Message, PlanReview
 from core.task_state import ErrorRecord, SourceReference, SubagentResult, TaskState
 
 
@@ -62,6 +62,11 @@ class ResearcherRunner(Protocol):
 
 
 class ImplementerRunner(Protocol):
+    def assess_evidence(
+        self, instruction: str, task_state: TaskState, *, validation_available: bool
+    ) -> EvidenceAssessment:
+        ...
+
     def run(self, instruction: str, task_state: TaskState, *args: object, **kwargs: object) -> ImplementerResult:
         ...
 
@@ -307,10 +312,43 @@ class MainAgent:
                     state.set_final_result(self._analysis_summary(state))
                     return self._result("completed", state, iteration, selected)
 
+                if self.implementer is None:
+                    return self._blocked(
+                        state, selected, iteration, "Implementer no está configurado."
+                    )
+
+                state.set_phase("evidence_assessment")
+                assessment = self.implementer.assess_evidence(
+                    request, state, validation_available=self.tester is not None
+                )
+                state.record_evidence_assessment(assessment)
+                if assessment.status == "partial":
+                    missing_evidence = set(assessment.missing_information)
+                    if missing_evidence & {
+                        "convenciones del componente", "impacto del cambio",
+                        "archivos objetivo", "archivos objetivo existentes",
+                    }:
+                        state.set_phase("exploration")
+                        self.explorer.run(request, state)
+                        selected.append("explorer")
+                    if "fuentes de respaldo" in missing_evidence and self.researcher is not None:
+                        state.set_phase("research")
+                        self.researcher.run(request, state)
+                        selected.append("researcher")
+                    state.set_phase("evidence_assessment")
+                    assessment = self.implementer.assess_evidence(
+                        request, state, validation_available=self.tester is not None
+                    )
+                    state.record_evidence_assessment(assessment)
+                if assessment.status != "sufficient":
+                    return self._blocked(
+                        state, selected, iteration,
+                        self._evidence_blocked_reason(assessment),
+                    )
+
                 missing = [
                     name
                     for name, agent in (
-                        ("Implementer", self.implementer),
                         ("Tester", self.tester),
                         ("Reviewer", self.reviewer),
                     )
@@ -323,7 +361,6 @@ class MainAgent:
                     )
 
                 state.set_phase("implementation")
-                assert self.implementer is not None
                 implementation = self.implementer.run(
                     request, state, mode="apply_changes"
                 )
@@ -396,6 +433,20 @@ class MainAgent:
     def _analysis_summary(state: TaskState) -> str:
         findings = "\n".join(f"- {item}" for item in state.repository_findings)
         return "Análisis completado sin cambios.\n" + (findings or "Sin hallazgos.")
+
+    @staticmethod
+    def _evidence_blocked_reason(assessment: EvidenceAssessment) -> str:
+        return json.dumps(
+            {
+                "status": assessment.status,
+                "blockers": list(assessment.risks),
+                "missing_information": list(assessment.missing_information),
+                "risks": list(assessment.risks),
+                "recommended_action": assessment.recommended_action,
+                "confidence": assessment.confidence,
+            },
+            ensure_ascii=False,
+        )
 
     def _blocked(
         self,

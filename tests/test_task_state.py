@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from core.models import EvidenceAssessment
 from core.task_state import (
     ErrorRecord,
     SourceReference,
@@ -11,6 +12,35 @@ from core.task_state import (
     TaskState,
     ToolExecutionRecord,
 )
+
+
+def test_records_and_serializes_current_evidence_assessment() -> None:
+    state = TaskState.create("Cambiar", task_id="evidence-task")
+    state.propose_plan("1. Cambiar")
+    state.approve_plan()
+    assessment = EvidenceAssessment(
+        "sufficient", ("src/app.py",), (), ("Riesgo bajo",), "proceed", 0.9
+    )
+
+    state.record_evidence_assessment(assessment)
+    restored = TaskState.from_json(state.to_json())
+
+    assert restored.evidence_assessment == assessment
+    assert restored.has_current_sufficient_evidence is True
+
+
+def test_new_plan_invalidates_previous_evidence_assessment() -> None:
+    state = TaskState.create("Cambiar")
+    state.propose_plan("Plan inicial")
+    state.approve_plan()
+    state.record_evidence_assessment(
+        EvidenceAssessment("sufficient", ("src/app.py",), (), (), "proceed", 1.0)
+    )
+
+    state.propose_plan("Plan nuevo")
+
+    assert state.evidence_assessment is None
+    assert state.has_current_sufficient_evidence is False
 
 
 def test_creates_task_with_defaults_and_generated_id() -> None:

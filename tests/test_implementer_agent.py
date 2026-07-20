@@ -13,7 +13,7 @@ from agents.implementer import (
     ImplementerBlockedError,
     ScopedWritePolicy,
 )
-from core.models import LLMResponse, LLMUsage, Message
+from core.models import EvidenceAssessment, LLMResponse, LLMUsage, Message
 from core.task_state import SourceReference, SubagentResult, TaskState
 
 
@@ -69,13 +69,18 @@ class FakeImplementerLLM:
         )
 
 
-def ready_state(*relevant_files: str, with_research: bool = True) -> TaskState:
+def ready_state(
+    *relevant_files: str,
+    with_research: bool = True,
+    with_assessment: bool = True,
+) -> TaskState:
     state = TaskState.create("Cambiar el saludo", task_id="implementation-task")
     state.propose_plan("1. Leer el archivo relevante.\n2. Cambiar sólo el saludo.")
     state.approve_plan()
     state.add_repository_finding(
         "convention=mantener nombres existentes; evidencia: archivo fuente."
     )
+    state.add_repository_finding("impact=el cambio queda limitado al archivo seleccionado.")
     state.add_subagent_result(
         SubagentResult(
             "explorer",
@@ -98,6 +103,10 @@ def ready_state(*relevant_files: str, with_research: bool = True) -> TaskState:
                 sources=(evidence,),
                 confidence=0.9,
             )
+        )
+    if with_assessment:
+        state.record_evidence_assessment(
+            EvidenceAssessment("sufficient", ("docs/greeting",), (), (), "proceed", 1.0)
         )
     return state
 
@@ -219,6 +228,128 @@ def test_blocks_without_sufficient_research_evidence(python_project: Path) -> No
         agent.run("Cambiar saludo", state)
 
     assert llm.calls == 0
+
+
+def test_apply_changes_rejects_without_current_sufficient_assessment(
+    python_project: Path,
+) -> None:
+    state = ready_state("app.py", with_assessment=False)
+    llm = FakeImplementerLLM(
+        path="app.py", old_text='GREETING = "hello"', new_text='GREETING = "hola"'
+    )
+    agent = ImplementerAgent(
+        llm_client=llm, write_policy=ScopedWritePolicy(python_project)
+    )
+
+    with pytest.raises(ImplementerBlockedError, match="EvidenceAssessment sufficient vigente"):
+        agent.run("Cambiar saludo", state, mode="apply_changes")
+
+    assert llm.calls == 0
+    assert state.files_modified == ()
+
+
+def test_propose_only_remains_available_without_evidence_assessment(
+    python_project: Path,
+) -> None:
+    state = ready_state("app.py", with_assessment=False)
+    llm = FakeImplementerLLM(
+        path="app.py", old_text='GREETING = "hello"', new_text='GREETING = "hola"'
+    )
+    agent = ImplementerAgent(
+        llm_client=llm, write_policy=ScopedWritePolicy(python_project)
+    )
+
+    result = agent.run("Cambiar saludo", state, mode="propose_only")
+
+    assert result.files_modified == ()
+    assert llm.calls == 1
+
+
+def test_evidence_gate_is_sufficient_for_supported_existing_target(
+    python_project: Path,
+) -> None:
+    state = ready_state("app.py", with_assessment=False)
+    agent = ImplementerAgent(
+        llm_client=FakeImplementerLLM(
+            path="app.py", old_text='GREETING = "hello"', new_text='GREETING = "hola"'
+        ),
+        write_policy=ScopedWritePolicy(python_project),
+    )
+
+    assessment = agent.assess_evidence("Cambiar", state, validation_available=True)
+
+    assert assessment.status == "sufficient"
+
+
+@pytest.mark.parametrize(
+    ("condition", "expected_text"),
+    [
+        ("ambiguous", "Ambigüedad"),
+        ("contradictory", "contradictorias"),
+        ("no_validation", "validación"),
+        ("excessive_risk", "excesivo"),
+    ],
+)
+def test_evidence_gate_blocks_detected_conditions_without_writing(
+    python_project: Path, condition: str, expected_text: str
+) -> None:
+    state = ready_state("app.py", with_assessment=False)
+    if condition == "ambiguous":
+        state.add_warning("Ambigüedad: no se identifica el contrato a conservar.")
+    elif condition == "contradictory":
+        state.add_warning("Fuentes contradictorias describen resultados distintos.")
+    elif condition == "excessive_risk":
+        state.add_warning("Riesgo excesivo de pérdida de datos.")
+    agent = ImplementerAgent(
+        llm_client=FakeImplementerLLM(
+            path="app.py", old_text='GREETING = "hello"', new_text='GREETING = "hola"'
+        ),
+        write_policy=ScopedWritePolicy(python_project),
+    )
+
+    assessment = agent.assess_evidence(
+        "Cambiar", state, validation_available=condition != "no_validation"
+    )
+
+    assert assessment.status == "insufficient"
+    assert any(expected_text.casefold() in risk.casefold() for risk in assessment.risks)
+    assert state.files_modified == ()
+
+
+def test_evidence_gate_blocks_nonexistent_target_without_writing(
+    python_project: Path,
+) -> None:
+    state = ready_state("missing.py", with_assessment=False)
+    agent = ImplementerAgent(
+        llm_client=FakeImplementerLLM(path="missing.py", old_text="old", new_text="new"),
+        write_policy=ScopedWritePolicy(python_project),
+    )
+
+    assessment = agent.assess_evidence("Cambiar", state, validation_available=True)
+
+    assert assessment.status == "insufficient"
+    assert any("no existe" in risk for risk in assessment.risks)
+    assert state.files_modified == ()
+
+
+def test_evidence_gate_blocks_denied_write_policy_without_writing(
+    python_project: Path,
+) -> None:
+    protected = python_project / "secret.txt"
+    protected.write_text("value", encoding="utf-8")
+    state = ready_state("secret.txt", with_assessment=False)
+    agent = ImplementerAgent(
+        llm_client=FakeImplementerLLM(
+            path="secret.txt", old_text="value", new_text="changed"
+        ),
+        write_policy=ScopedWritePolicy(python_project),
+    )
+
+    assessment = agent.assess_evidence("Cambiar", state, validation_available=True)
+
+    assert assessment.status == "insufficient"
+    assert "permisos de modificación" in assessment.missing_information
+    assert protected.read_text(encoding="utf-8") == "value"
 
 
 def test_rejects_change_outside_explorer_relevant_files(
