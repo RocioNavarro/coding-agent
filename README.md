@@ -61,10 +61,16 @@ cada una (no inferencia) y quedar registrado como evidencia reproducible (output
   incluye un `HtmlDocumentParser` propio para extraer texto limpio de las páginas
   de Kotlin sin ruido de HTML).
 - Existe un script de composición (`run_agent.py`) que arma `MainAgent` con Explorer
-  y Researcher reales desde `agent.config.yaml` — validado end-to-end contra la API
-  real de OpenAI (llegó a llamarla; falló sólo por cuota agotada de la cuenta usada
-  para probar, no por un error del código). Es todo lo que este caso de uso necesita:
-  no se conectan Implementer/Tester/Reviewer.
+  y Researcher reales desde `agent.config.yaml`. Es todo lo que este caso de uso
+  necesita: no se conectan Implementer/Tester/Reviewer.
+- **Ya hay dos corridas reales completadas** contra el checkout de PrintScript, con
+  el modelo `gpt-5-nano` real y observabilidad Langfuse real activa. Documentadas en
+  `evidence/`: `tarea-1-analisis-arquitectura.md` (arquitectura y módulos, citando
+  RAG de Kotlin y de la spec de PrintScript), `tarea-2-bug-encontrado-y-arreglado.md`
+  (una pregunta sin evidencia suficiente que además destapó y permitió arreglar un
+  bug real de arquitectura — ver más abajo), `entregable-7-langfuse.md` (link a la
+  traza completa real) y `reflexion-final.md` (qué funcionó, qué falló, qué se
+  mejoraría).
 
 ## Requisitos
 
@@ -547,4 +553,14 @@ declara resultados de una corrida externa no ejecutada.
   comportamiento interno de cualquier ejecutable permitido.
 - La búsqueda web y las fuentes RAG URL requieren red y credenciales/configuración
   externas; su disponibilidad no está garantizada.
-- No se incluye una corrida ni un perfil específico de PrintScript.
+- Se encontraron y corrigieron dos bugs reales durante las corridas de evidencia
+  contra PrintScript (ver `evidence/reflexion-final.md`): el prompt de salida de los
+  subagentes no restringía los valores válidos de `origin` en las fuentes, y
+  `BaseAgent` ofrecía tools al LLM sin ejecutarlas nunca, lo que fallaba de forma
+  determinista ante preguntas que llevaban al modelo a pedir una tool. Ambos quedan
+  arreglados y verificados (389 tests en verde), pero es la clase de fragilidad
+  esperable al integrar un LLM real por primera vez contra un caso de uso concreto.
+- El caso de uso de PrintScript quedó acotado deliberadamente a análisis puro
+  (Explorer + Researcher); no se conectó Implementer/Tester/Reviewer a esta corrida
+  real, así que `ProgressMonitor` no se ejercitó con una corrida en vivo (sí con los
+  escenarios de `tests/integration/`).
