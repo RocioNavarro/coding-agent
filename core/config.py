@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -77,7 +78,7 @@ def _domains(value: object, field: str) -> tuple[str, ...]:
 
 def _inside(workspace: Path, value: object, field: str) -> Path:
     text = _text(value, field) or ""
-    path = Path(text)
+    path = Path(text).expanduser()
     resolved = path.resolve() if path.is_absolute() else (workspace / path).resolve()
     try:
         resolved.relative_to(workspace)
@@ -142,6 +143,7 @@ class RagConfig:
     enabled: bool
     index_path: Path
     sources: tuple[SourceConfig, ...] = ()
+    index_path_explicit: bool = False
 
 
 @dataclass(frozen=True)
@@ -189,8 +191,13 @@ class AgentConfig:
     profile: ProjectProfile
 
 
-def load_agent_config(path: str | Path = "agent.config.yaml") -> AgentConfig:
+def load_agent_config(
+    path: str | Path = "agent.config.yaml",
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> AgentConfig:
     """Carga YAML, aplica defaults y resuelve rutas locales con confinamiento."""
+    environment = os.environ if environ is None else environ
     config_path = Path(path).resolve()
     try:
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -213,10 +220,34 @@ def load_agent_config(path: str | Path = "agent.config.yaml") -> AgentConfig:
 
     workspace_values = _mapping(root.get("workspace"), "workspace")
     _known(workspace_values, {"path", "ignore"}, "workspace")
-    workspace_text = _text(workspace_values.get("path"), "workspace.path")
-    workspace_path = (config_path.parent / (workspace_text or "")).resolve()
+    environment_workspace = environment.get("CODING_AGENT_WORKSPACE")
+    if environment_workspace is not None:
+        workspace_text = _text(
+            environment_workspace, "CODING_AGENT_WORKSPACE"
+        ) or ""
+        expanded_workspace = Path(workspace_text).expanduser()
+        if not expanded_workspace.is_absolute():
+            raise AgentConfigError(
+                "CODING_AGENT_WORKSPACE debe ser una ruta absoluta."
+            )
+        workspace_path = expanded_workspace.resolve()
+    else:
+        workspace_text = _text(workspace_values.get("path"), "workspace.path") or ""
+        expanded_workspace = Path(workspace_text).expanduser()
+        workspace_path = (
+            expanded_workspace.resolve()
+            if expanded_workspace.is_absolute()
+            else (config_path.parent / expanded_workspace).resolve()
+        )
     if not workspace_path.is_dir():
-        raise AgentConfigError(f"workspace.path no existe o no es un directorio: {workspace_path}")
+        source = (
+            "CODING_AGENT_WORKSPACE"
+            if environment_workspace is not None
+            else "workspace.path"
+        )
+        raise AgentConfigError(
+            f"{source} no existe o no es un directorio: {workspace_path}"
+        )
     workspace = WorkspaceConfig(
         workspace_path,
         _strings(workspace_values.get("ignore"), "workspace.ignore"),
@@ -226,8 +257,8 @@ def load_agent_config(path: str | Path = "agent.config.yaml") -> AgentConfig:
     permissions = _permissions(root.get("permissions"))
     commands = _commands(root.get("commands"))
     limits = _limits(root.get("limits"))
-    rag = _rag(root.get("rag"), workspace_path)
-    memory = _memory(root.get("memory"), workspace_path)
+    rag = _rag(root.get("rag"), workspace_path, environment)
+    memory = _memory(root.get("memory"), workspace_path, environment)
     observability = _observability(root.get("observability"))
     web_search = _web_search(root.get("web_search"), limits.max_web_results)
     if web_search.enabled and not permissions.web_search:
@@ -308,11 +339,23 @@ def _limits(value: object) -> LimitsConfig:
     )
 
 
-def _rag(value: object, workspace: Path) -> RagConfig:
+def _rag(
+    value: object, workspace: Path, environment: Mapping[str, str]
+) -> RagConfig:
     values = _mapping(value, "rag")
     _known(values, {"enabled", "index_path", "sources"}, "rag")
     enabled = _boolean(values.get("enabled", False), "rag.enabled")
-    index_path = _inside(workspace, values.get("index_path", ".coding-agent/rag/index.json"), "rag.index_path")
+    environment_index = environment.get("CODING_AGENT_RAG_INDEX_PATH")
+    index_path_explicit = environment_index is not None or "index_path" in values
+    index_path = _inside(
+        workspace,
+        environment_index
+        if environment_index is not None
+        else values.get("index_path", ".coding-agent/rag/index.json"),
+        "CODING_AGENT_RAG_INDEX_PATH"
+        if environment_index is not None
+        else "rag.index_path",
+    )
     raw_sources = values.get("sources", [])
     if not isinstance(raw_sources, list):
         raise AgentConfigError("rag.sources debe ser una lista.")
@@ -345,15 +388,26 @@ def _rag(value: object, workspace: Path) -> RagConfig:
         sources.append(source)
     if enabled and not sources:
         raise AgentConfigError("rag.enabled requiere al menos una fuente.")
-    return RagConfig(enabled, index_path, tuple(sources))
+    return RagConfig(enabled, index_path, tuple(sources), index_path_explicit)
 
 
-def _memory(value: object, workspace: Path) -> MemoryConfig:
+def _memory(
+    value: object, workspace: Path, environment: Mapping[str, str]
+) -> MemoryConfig:
     values = _mapping(value, "memory")
     _known(values, {"enabled", "path", "identifier"}, "memory")
+    environment_memory = environment.get("CODING_AGENT_MEMORY_PATH")
     return MemoryConfig(
         _boolean(values.get("enabled", True), "memory.enabled"),
-        _inside(workspace, values.get("path", ".coding-agent/memory"), "memory.path"),
+        _inside(
+            workspace,
+            environment_memory
+            if environment_memory is not None
+            else values.get("path", ".coding-agent/memory"),
+            "CODING_AGENT_MEMORY_PATH"
+            if environment_memory is not None
+            else "memory.path",
+        ),
         _text(values.get("identifier"), "memory.identifier", optional=True),
     )
 

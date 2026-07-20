@@ -1,11 +1,11 @@
 {
-  "index_path": "../../PrintScript/.coding-agent/rag/index.json",
+  "index_path": ".coding-agent/rag/index.json",
   "sources": [
     {
       "name": "printscript-language-spec",
       "loader": "local",
       "source_type": "documentation",
-      "path": "../../PrintScript/docs/printscript-language-spec.md",
+      "path": "docs/printscript-language-spec.md",
       "tags": ["documentation", "language-spec"]
     },
     {

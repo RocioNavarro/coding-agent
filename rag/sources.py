@@ -26,7 +26,7 @@ UrlFetcher = Callable[[str, str], str]
 
 
 class SourceManifest:
-    """Configuración validada y resoluble respecto del archivo manifiesto."""
+    """Configuración resoluble contra un workspace o, por compatibilidad, el manifiesto."""
 
     def __init__(
         self,
@@ -36,15 +36,23 @@ class SourceManifest:
         chunking: Mapping[str, Any] | None = None,
         embedding: Mapping[str, Any] | None = None,
         base_path: str | Path = ".",
+        workspace: str | Path | None = None,
     ) -> None:
         self.sources = tuple(sources)
         self.index_path = index_path
         self.chunking = dict(chunking or {})
         self.embedding = dict(embedding or {})
         self.base_path = Path(base_path).resolve()
+        self.workspace = Path(workspace).expanduser().resolve() if workspace else None
+        if self.workspace is not None and not self.workspace.is_dir():
+            raise SourceLoadError(
+                f"El workspace del manifiesto no existe o no es un directorio: {self.workspace}"
+            )
 
     @classmethod
-    def load(cls, path: str | Path) -> SourceManifest:
+    def load(
+        cls, path: str | Path, *, workspace: str | Path | None = None
+    ) -> SourceManifest:
         manifest_path = Path(path).resolve()
         try:
             data = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -60,14 +68,30 @@ class SourceManifest:
             chunking=data.get("chunking"),
             embedding=data.get("embedding"),
             base_path=manifest_path.parent,
+            workspace=workspace,
         )
+
+    def _resolve_local_path(self, value: str, field: str) -> Path:
+        path = Path(value).expanduser()
+        root = self.workspace or self.base_path
+        resolved = path.resolve() if path.is_absolute() else (root / path).resolve()
+        if self.workspace is not None:
+            try:
+                resolved.relative_to(self.workspace)
+            except ValueError as error:
+                raise SourceLoadError(
+                    f"{field} resuelve fuera del workspace: {resolved}"
+                ) from error
+        return resolved
 
     def resolved_sources(self) -> tuple[SourceConfig, ...]:
         result = []
         for source in self.sources:
             location = source.location
-            if source.loader == "local" and not Path(location).is_absolute():
-                location = (self.base_path / location).resolve().as_posix()
+            if source.loader == "local":
+                location = self._resolve_local_path(
+                    location, f"sources.{source.name}.path"
+                ).as_posix()
             result.append(
                 SourceConfig(
                     source.name, source.loader, source.source_type, location,
@@ -78,8 +102,7 @@ class SourceManifest:
         return tuple(result)
 
     def resolved_index_path(self) -> Path:
-        path = Path(self.index_path)
-        return path.resolve() if path.is_absolute() else (self.base_path / path).resolve()
+        return self._resolve_local_path(self.index_path, "index_path")
 
 
 class ConfiguredSourceLoader(SourceLoader):

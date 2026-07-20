@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+from pathlib import Path
 
+from core.settings import AgentSettings
 from rag.embeddings import HashEmbeddingProvider
 from rag.index_manager import IndexManager, IndexingResult
 from rag.processing import (
@@ -17,8 +19,14 @@ from rag.sources import ConfiguredSourceLoader, SourceManifest
 from rag.vector_store import JsonVectorStore
 
 
-def index_manifest(path: str, *, prune: bool = False) -> IndexingResult:
-    manifest = SourceManifest.load(path)
+def index_manifest(
+    path: str,
+    *,
+    prune: bool = False,
+    workspace: str | Path | None = None,
+    index_path: str | Path | None = None,
+) -> IndexingResult:
+    manifest = SourceManifest.load(path, workspace=workspace)
     provider = manifest.embedding.get("provider", "hash")
     if provider != "hash":
         raise ValueError(f"Embedding provider no configurado en esta instalación: {provider}")
@@ -38,9 +46,35 @@ def index_manifest(path: str, *, prune: bool = False) -> IndexingResult:
             respect_sections=bool(chunking.get("respect_sections", True)),
         ),
         embedding_provider=HashEmbeddingProvider(dimensions),
-        vector_store=JsonVectorStore(manifest.resolved_index_path()),
+        vector_store=JsonVectorStore(effective_index_path(manifest, index_path)),
     )
     return manager.index(manifest.resolved_sources(), prune=prune)
+
+
+def effective_index_path(
+    manifest: SourceManifest, configured_path: str | Path | None
+) -> Path:
+    """Prioriza un destino ya validado por AgentConfig sobre el manifiesto."""
+    return (
+        Path(configured_path).resolve()
+        if configured_path is not None
+        else manifest.resolved_index_path()
+    )
+
+
+def configured_rag_paths() -> tuple[Path | None, Path | None]:
+    """Obtiene workspace e índice explícito; sin config conserva el modo genérico."""
+    settings = AgentSettings.from_environment()
+    if settings.agent_config is None:
+        return None, None
+    config = settings.agent_config
+    index_path = config.rag.index_path if config.rag.index_path_explicit else None
+    return config.workspace.path, index_path
+
+
+def configured_workspace() -> Path | None:
+    """Compatibilidad para consumidores que sólo necesitan el workspace efectivo."""
+    return configured_rag_paths()[0]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -52,7 +86,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     arguments = parser.parse_args(argv)
     try:
-        result = index_manifest(arguments.manifest, prune=arguments.prune)
+        workspace, index_path = configured_rag_paths()
+        result = index_manifest(
+            arguments.manifest,
+            prune=arguments.prune,
+            workspace=workspace,
+            index_path=index_path,
+        )
     except Exception as error:
         parser.exit(1, f"Error de indexación: {error}\n")
     print(

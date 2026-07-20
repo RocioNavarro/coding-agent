@@ -3,12 +3,20 @@
 import json
 from pathlib import Path
 
-from rag.cli import index_manifest, main
+import pytest
+
+from rag.cli import (
+    configured_rag_paths,
+    configured_workspace,
+    effective_index_path,
+    index_manifest,
+    main,
+)
 from rag.embeddings import HashEmbeddingProvider
 from rag.index_manager import IndexManager
 from rag.models import SourceConfig
 from rag.processing import ConfigurableChunker, SectionDocumentParser, WhitespaceNormalizer
-from rag.sources import ConfiguredSourceLoader, SourceManifest
+from rag.sources import ConfiguredSourceLoader, SourceLoadError, SourceManifest
 from rag.vector_store import JsonVectorStore
 
 
@@ -162,7 +170,7 @@ def test_incremental_update_replaces_only_changed_document(tmp_path: Path) -> No
 
 
 def test_vector_index_persists_and_manifest_cli_reuses_it(
-    tmp_path: Path, capsys
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     write(tmp_path / "docs" / "README.md", "# Persistent\nIndex content")
     manifest_path = tmp_path / "rag-manifest.json"
@@ -192,6 +200,8 @@ def test_vector_index_persists_and_manifest_cli_reuses_it(
     )
 
     first = index_manifest(str(manifest_path))
+    monkeypatch.chdir(tmp_path)
+    manifest_before = manifest_path.read_bytes()
     exit_code = main([str(manifest_path)])
     reloaded = JsonVectorStore(tmp_path / "data" / "index.json")
     reloaded.load()
@@ -203,3 +213,280 @@ def test_vector_index_persists_and_manifest_cli_reuses_it(
     persisted = json.loads((tmp_path / "data" / "index.json").read_text(encoding="utf-8"))
     assert persisted["schema_version"] == 1
     assert persisted["documents"]
+    assert manifest_path.read_bytes() == manifest_before
+
+
+def test_manifest_resolves_relative_paths_against_explicit_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    (workspace / "docs").mkdir(parents=True)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "index_path": ".coding-agent/rag/index.json",
+                "sources": [
+                    {
+                        "name": "docs",
+                        "loader": "local",
+                        "source_type": "documentation",
+                        "path": "docs/reference.md",
+                    },
+                    {
+                        "name": "remote",
+                        "loader": "url",
+                        "source_type": "documentation",
+                        "url": "https://docs.example/reference",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = SourceManifest.load(manifest_path, workspace=workspace)
+    sources = {source.name: source.location for source in manifest.resolved_sources()}
+
+    assert manifest.resolved_index_path() == (
+        workspace / ".coding-agent/rag/index.json"
+    ).resolve()
+    assert sources["docs"] == (workspace / "docs/reference.md").resolve().as_posix()
+    assert sources["remote"] == "https://docs.example/reference"
+
+
+def test_manifest_accepts_absolute_internal_paths_and_expands_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    docs = workspace / "docs"
+    docs.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(workspace))
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "index_path": str(workspace / "index.json"),
+                "sources": [
+                    {
+                        "name": "docs",
+                        "loader": "local",
+                        "source_type": "documentation",
+                        "path": "~/docs/reference.md",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = SourceManifest.load(manifest_path, workspace=workspace)
+
+    assert manifest.resolved_index_path() == (workspace / "index.json").resolve()
+    assert manifest.resolved_sources()[0].location == (
+        workspace / "docs/reference.md"
+    ).resolve().as_posix()
+
+
+@pytest.mark.parametrize(
+    ("index_path", "source_path", "message"),
+    [
+        ("../outside/index.json", "docs/reference.md", "index_path"),
+        (".coding-agent/index.json", "../outside/reference.md", "sources.docs.path"),
+    ],
+)
+def test_manifest_rejects_paths_outside_explicit_workspace(
+    tmp_path: Path, index_path: str, source_path: str, message: str
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "index_path": index_path,
+                "sources": [
+                    {
+                        "name": "docs",
+                        "loader": "local",
+                        "source_type": "documentation",
+                        "path": source_path,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest = SourceManifest.load(manifest_path, workspace=workspace)
+
+    with pytest.raises(SourceLoadError, match=message):
+        manifest.resolved_index_path() if message == "index_path" else manifest.resolved_sources()
+
+
+def test_manifest_rejects_absolute_path_outside_explicit_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "index_path": str(tmp_path / "outside/index.json"),
+                "sources": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest = SourceManifest.load(manifest_path, workspace=workspace)
+
+    with pytest.raises(SourceLoadError, match="index_path"):
+        manifest.resolved_index_path()
+
+
+def test_printscript_manifest_uses_workspace_relative_paths() -> None:
+    manifest_path = Path(__file__).resolve().parents[1] / "rag.manifest.printscript.json"
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    local_source = next(source for source in data["sources"] if source["loader"] == "local")
+
+    assert data["index_path"] == ".coding-agent/rag/index.json"
+    assert local_source["path"] == "docs/printscript-language-spec.md"
+    assert "../../PrintScript" not in manifest_path.read_text(encoding="utf-8")
+
+
+def test_cli_workspace_uses_environment_override_before_yaml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    yaml_workspace = tmp_path / "yaml-workspace"
+    environment_workspace = tmp_path / "environment-workspace"
+    yaml_workspace.mkdir()
+    environment_workspace.mkdir()
+    config_path = tmp_path / "agent.config.yaml"
+    config_path.write_text(
+        "workspace:\n  path: yaml-workspace\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("CODING_AGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("CODING_AGENT_WORKSPACE", str(environment_workspace))
+
+    assert configured_workspace() == environment_workspace.resolve()
+
+
+def test_cli_workspace_falls_back_to_yaml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "yaml-workspace"
+    workspace.mkdir()
+    config_path = tmp_path / "agent.config.yaml"
+    config_path.write_text(
+        "workspace:\n  path: yaml-workspace\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("CODING_AGENT_CONFIG", str(config_path))
+    monkeypatch.delenv("CODING_AGENT_WORKSPACE", raising=False)
+
+    assert configured_workspace() == workspace.resolve()
+
+
+def test_cli_index_override_has_priority_over_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config_path = tmp_path / "agent.config.yaml"
+    config_path.write_text(
+        "workspace:\n  path: workspace\nrag:\n  index_path: yaml/index.json\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODING_AGENT_CONFIG", str(config_path))
+    monkeypatch.setenv(
+        "CODING_AGENT_RAG_INDEX_PATH", ".coding-agent/rag/custom-index.json"
+    )
+
+    resolved_workspace, configured_index = configured_rag_paths()
+
+    assert resolved_workspace == workspace.resolve()
+    assert configured_index == (
+        workspace / ".coding-agent/rag/custom-index.json"
+    ).resolve()
+
+
+def test_cli_yaml_index_has_priority_over_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config_path = tmp_path / "agent.config.yaml"
+    config_path.write_text(
+        "workspace:\n  path: workspace\nrag:\n  index_path: custom/index.json\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODING_AGENT_CONFIG", str(config_path))
+    monkeypatch.delenv("CODING_AGENT_RAG_INDEX_PATH", raising=False)
+
+    _, configured_index = configured_rag_paths()
+
+    assert configured_index == (workspace / "custom/index.json").resolve()
+
+
+def test_cli_uses_manifest_index_when_config_has_no_explicit_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config_path = tmp_path / "agent.config.yaml"
+    config_path.write_text("workspace:\n  path: workspace\n", encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({"index_path": "manifest/index.json", "sources": []}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODING_AGENT_CONFIG", str(config_path))
+    monkeypatch.delenv("CODING_AGENT_RAG_INDEX_PATH", raising=False)
+
+    resolved_workspace, configured_index = configured_rag_paths()
+    manifest = SourceManifest.load(manifest_path, workspace=resolved_workspace)
+
+    assert configured_index is None
+    assert effective_index_path(manifest, configured_index) == (
+        workspace / "manifest/index.json"
+    ).resolve()
+
+
+def test_cli_and_agent_share_exact_explicit_index_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config_path = tmp_path / "agent.config.yaml"
+    config_path.write_text("workspace:\n  path: workspace\n", encoding="utf-8")
+    monkeypatch.setenv("CODING_AGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("CODING_AGENT_RAG_INDEX_PATH", "custom/index.json")
+
+    from core.settings import AgentSettings
+
+    agent_index = AgentSettings.from_environment().agent_config.rag.index_path
+    _, cli_index = configured_rag_paths()
+
+    assert cli_index == agent_index
+
+
+def test_cli_generic_mode_keeps_manifest_index_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CODING_AGENT_CONFIG", raising=False)
+    monkeypatch.delenv("CODING_AGENT_WORKSPACE", raising=False)
+    monkeypatch.delenv("CODING_AGENT_RAG_INDEX_PATH", raising=False)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({"index_path": "data/index.json", "sources": []}),
+        encoding="utf-8",
+    )
+
+    workspace, configured_index = configured_rag_paths()
+    manifest = SourceManifest.load(manifest_path, workspace=workspace)
+
+    assert workspace is None
+    assert configured_index is None
+    assert effective_index_path(manifest, configured_index) == (
+        tmp_path / "data/index.json"
+    ).resolve()

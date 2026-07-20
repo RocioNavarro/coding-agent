@@ -7,6 +7,17 @@ import pytest
 from core.config import AgentConfigError, load_agent_config
 
 
+@pytest.fixture(autouse=True)
+def clear_workspace_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Aísla los tests de una configuración local exportada por el usuario."""
+    for variable in (
+        "CODING_AGENT_WORKSPACE",
+        "CODING_AGENT_RAG_INDEX_PATH",
+        "CODING_AGENT_MEMORY_PATH",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+
+
 def write_config(tmp_path: Path, content: str) -> Path:
     path = tmp_path / "agent.config.yaml"
     path.write_text(content, encoding="utf-8")
@@ -30,6 +41,195 @@ def test_loads_minimal_config_with_defaults_and_without_technology(tmp_path: Pat
     assert config.observability.log_level == "INFO"
     assert config.web_search.enabled is False
     assert config.web_search.allowed_domains == ()
+
+
+def test_workspace_environment_override_has_priority_over_yaml(tmp_path: Path) -> None:
+    yaml_workspace = tmp_path / "yaml-project"
+    yaml_workspace.mkdir()
+    environment_workspace = tmp_path / "environment-project"
+    environment_workspace.mkdir()
+
+    config = load_agent_config(
+        write_config(tmp_path, "workspace:\n  path: yaml-project\n"),
+        environ={"CODING_AGENT_WORKSPACE": str(environment_workspace)},
+    )
+
+    assert config.workspace.path == environment_workspace.resolve()
+
+
+def test_workspace_environment_override_expands_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    config = load_agent_config(
+        write_config(tmp_path, "workspace:\n  path: missing\n"),
+        environ={"CODING_AGENT_WORKSPACE": "~/project"},
+    )
+
+    assert config.workspace.path == workspace.resolve()
+
+
+def test_workspace_yaml_expands_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    config = load_agent_config(
+        write_config(tmp_path, "workspace:\n  path: ~/project\n"),
+        environ={},
+    )
+
+    assert config.workspace.path == workspace.resolve()
+
+
+def test_workspace_environment_override_rejects_missing_directory(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "missing"
+
+    with pytest.raises(
+        AgentConfigError, match="CODING_AGENT_WORKSPACE no existe o no es un directorio"
+    ):
+        load_agent_config(
+            write_config(tmp_path, "workspace:\n  path: project\n"),
+            environ={"CODING_AGENT_WORKSPACE": str(missing)},
+        )
+
+
+def test_workspace_environment_override_must_be_absolute(tmp_path: Path) -> None:
+    with pytest.raises(AgentConfigError, match="debe ser una ruta absoluta"):
+        load_agent_config(
+            write_config(tmp_path, "workspace:\n  path: project\n"),
+            environ={"CODING_AGENT_WORKSPACE": "relative/project"},
+        )
+
+
+def test_rag_and_memory_environment_overrides_have_priority_over_yaml(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    config = load_agent_config(
+        write_config(
+            tmp_path,
+            """
+workspace:
+  path: project
+rag:
+  index_path: yaml/index.json
+memory:
+  path: yaml/memory
+""",
+        ),
+        environ={
+            "CODING_AGENT_RAG_INDEX_PATH": ".coding-agent/rag/index.json",
+            "CODING_AGENT_MEMORY_PATH": ".coding-agent/memory",
+        },
+    )
+
+    assert config.rag.index_path == (workspace / ".coding-agent/rag/index.json").resolve()
+    assert config.memory.path == (workspace / ".coding-agent/memory").resolve()
+
+
+def test_rag_and_memory_defaults_resolve_inside_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    config = load_agent_config(
+        write_config(tmp_path, "workspace:\n  path: project\n"), environ={}
+    )
+
+    assert config.rag.index_path == (workspace / ".coding-agent/rag/index.json").resolve()
+    assert config.memory.path == (workspace / ".coding-agent/memory").resolve()
+    assert config.rag.index_path.exists() is False
+    assert config.memory.path.exists() is False
+    assert config.rag.index_path_explicit is False
+
+
+def test_rag_and_memory_environment_overrides_accept_absolute_paths_inside_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    index_path = workspace / "local/rag.json"
+    memory_path = workspace / "local/memory"
+
+    config = load_agent_config(
+        write_config(tmp_path, "workspace:\n  path: project\n"),
+        environ={
+            "CODING_AGENT_RAG_INDEX_PATH": str(index_path),
+            "CODING_AGENT_MEMORY_PATH": str(memory_path),
+        },
+    )
+
+    assert config.rag.index_path == index_path.resolve()
+    assert config.memory.path == memory_path.resolve()
+    assert config.rag.index_path_explicit is True
+
+
+def test_rag_and_memory_environment_overrides_expand_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(workspace))
+
+    config = load_agent_config(
+        write_config(tmp_path, "workspace:\n  path: project\n"),
+        environ={
+            "CODING_AGENT_RAG_INDEX_PATH": "~/.coding-agent/rag/index.json",
+            "CODING_AGENT_MEMORY_PATH": "~/.coding-agent/memory",
+        },
+    )
+
+    assert config.rag.index_path == (workspace / ".coding-agent/rag/index.json").resolve()
+    assert config.memory.path == (workspace / ".coding-agent/memory").resolve()
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("CODING_AGENT_RAG_INDEX_PATH", "../outside/index.json"),
+        ("CODING_AGENT_MEMORY_PATH", "../outside/memory"),
+    ],
+)
+def test_rag_and_memory_environment_overrides_reject_relative_escape(
+    tmp_path: Path, variable: str, value: str
+) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    with pytest.raises(AgentConfigError, match=variable):
+        load_agent_config(
+            write_config(tmp_path, "workspace:\n  path: project\n"),
+            environ={variable: value},
+        )
+
+
+@pytest.mark.parametrize(
+    ("variable", "suffix"),
+    [
+        ("CODING_AGENT_RAG_INDEX_PATH", "index.json"),
+        ("CODING_AGENT_MEMORY_PATH", "memory"),
+    ],
+)
+def test_rag_and_memory_environment_overrides_reject_absolute_escape(
+    tmp_path: Path, variable: str, suffix: str
+) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    outside = tmp_path / "outside" / suffix
+
+    with pytest.raises(AgentConfigError, match=variable):
+        load_agent_config(
+            write_config(tmp_path, "workspace:\n  path: project\n"),
+            environ={variable: str(outside)},
+        )
 
 
 def test_loads_all_sections_and_resolves_paths_relative_to_config(tmp_path: Path) -> None:
