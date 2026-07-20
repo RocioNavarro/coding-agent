@@ -17,6 +17,10 @@ from agents.tester import (
 )
 from core.models import LLMResponse, LLMUsage, Message
 from core.task_state import TaskState
+from core.observability import ObservabilityEvent
+from core.progress import ProgressLimits, ProgressMonitor
+from core.settings import AgentSettings
+from security.policy_engine import AgentToolPermissions, PolicyContext
 
 
 class UnusedLLM:
@@ -71,6 +75,9 @@ def build_tester(
     executor: FakeExecutor,
     *,
     limits: ValidationLimits | None = None,
+    progress_monitor: ProgressMonitor | None = None,
+    observability=None,
+    policy_context: PolicyContext | None = None,
 ) -> AgentTester:
     return AgentTester(
         llm_client=UnusedLLM(),
@@ -78,7 +85,34 @@ def build_tester(
         providers=(StaticCommandProvider(commands),),
         executor=executor,
         limits=limits,
+        progress_monitor=progress_monitor,
+        observability=observability,
+        policy_context=policy_context,
     )
+
+
+class RecordingObservability:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.events: list[ObservabilityEvent] = []
+        self.fail = fail
+
+    def record(self, event: ObservabilityEvent) -> None:
+        if self.fail:
+            raise RuntimeError("provider unavailable")
+        self.events.append(event)
+
+    def flush(self) -> None:
+        return None
+
+
+class SequentialExecutor(ValidationExecutor):
+    def __init__(self, outcomes: Sequence[CommandOutcome]) -> None:
+        self.outcomes = iter(outcomes)
+        self.calls: list[tuple[str, float]] = []
+
+    def execute(self, command: str, *, timeout_seconds: float) -> CommandOutcome:
+        self.calls.append((command, timeout_seconds))
+        return next(self.outcomes)
 
 
 def test_prioritizes_specific_check_before_global_validation(
@@ -151,6 +185,136 @@ def test_reports_failed_command(python_repository: Path) -> None:
     assert result.records[0].status == "failed"
     assert result.records[0].exit_code == 1
     assert "AssertionError" in result.records[0].output
+
+
+def test_registers_equivalent_failures_in_progress_monitor(
+    python_repository: Path,
+) -> None:
+    command = ValidationCommand(
+        "python -m pytest", "configuration", "pyproject.toml", "test"
+    )
+    executor = SequentialExecutor(
+        (
+            CommandOutcome(1, 1.0, stderr="same failure"),
+            CommandOutcome(1, 1.0, stderr="same failure"),
+        )
+    )
+    progress = ProgressMonitor(ProgressLimits(command_error_repeats=2))
+    tester = AgentTester(
+        llm_client=UnusedLLM(), repository_root=python_repository,
+        providers=(StaticCommandProvider((command,)),), executor=executor,
+        limits=ValidationLimits(max_retries=1), progress_monitor=progress,
+    )
+
+    result = tester.run("Validar", changed_state("src/service.py"))
+
+    assert result.records[0].attempts == 2
+    detected = [item for item in result.progress_assessments if item.detected]
+    assert detected[-1].recommendation == "retry_with_new_strategy"
+
+
+def test_changed_command_result_is_progress(python_repository: Path) -> None:
+    command = ValidationCommand(
+        "python -m pytest", "configuration", "pyproject.toml", "test"
+    )
+    executor = SequentialExecutor(
+        (
+            CommandOutcome(1, 1.0, stderr="first failure"),
+            CommandOutcome(0, 1.0, stdout="passed"),
+        )
+    )
+    progress = ProgressMonitor(ProgressLimits(command_error_repeats=2))
+    tester = AgentTester(
+        llm_client=UnusedLLM(), repository_root=python_repository,
+        providers=(StaticCommandProvider((command,)),), executor=executor,
+        limits=ValidationLimits(max_retries=1), progress_monitor=progress,
+    )
+
+    result = tester.run("Validar", changed_state("src/service.py"))
+
+    assert result.status == "passed"
+    assert not any(item.detected for item in result.progress_assessments)
+
+
+def test_repeated_attempts_without_new_evidence_are_detected(
+    python_repository: Path,
+) -> None:
+    command = ValidationCommand(
+        "python -m pytest", "configuration", "pyproject.toml", "test"
+    )
+    failure = CommandOutcome(1, 1.0, stderr="unchanged failure")
+    executor = SequentialExecutor((failure, failure, failure))
+    progress = ProgressMonitor(
+        ProgressLimits(command_error_repeats=99, no_evidence_iterations=2)
+    )
+    tester = AgentTester(
+        llm_client=UnusedLLM(), repository_root=python_repository,
+        providers=(StaticCommandProvider((command,)),), executor=executor,
+        limits=ValidationLimits(max_retries=2), progress_monitor=progress,
+    )
+
+    result = tester.run("Validar", changed_state("src/service.py"))
+
+    detected = [item for item in result.progress_assessments if item.detected]
+    assert detected[-1].kind == "no_new_evidence"
+    assert detected[-1].recommendation == "stop"
+
+
+@pytest.mark.parametrize(
+    ("command", "supervision", "expected"),
+    [
+        ("python -m pytest", False, "allow"),
+        ("rm -rf .", False, "deny"),
+        ("python -m pytest", True, "require_approval"),
+    ],
+)
+def test_policy_decision_emits_one_observation(
+    python_repository: Path, command: str, supervision: bool, expected: str
+) -> None:
+    validation = ValidationCommand(
+        command, "configuration", "repository configuration", "test"
+    )
+    executor = FakeExecutor(
+        {command: CommandOutcome(0, 1.0, stdout="passed")}
+        if expected == "allow" else {}
+    )
+    observed = RecordingObservability()
+    policy_context = PolicyContext(
+        agent="tester", workspace=python_repository,
+        settings=AgentSettings(supervision_enabled=supervision),
+        permissions=AgentToolPermissions(
+            approval_tools=(frozenset({"run_command"}) if supervision else frozenset())
+        ),
+    )
+    tester = build_tester(
+        python_repository, (validation,), executor,
+        observability=observed, policy_context=policy_context,
+    )
+
+    result = tester.run("Validar", changed_state("src/service.py"))
+
+    events = [event for event in observed.events if event.name == "tester-policy-decision"]
+    assert len(events) == 1
+    assert events[0].payload["decision"] == expected
+    assert events[0].payload["approval_required"] is (expected == "require_approval")
+    assert result.status == ("passed" if expected == "allow" else "blocked")
+
+
+def test_observability_failure_does_not_interrupt_tester(
+    python_repository: Path,
+) -> None:
+    command = ValidationCommand(
+        "python -m pytest", "configuration", "pyproject.toml", "test"
+    )
+    executor = FakeExecutor(
+        {command.command: CommandOutcome(0, 1.0, stdout="passed")}
+    )
+    tester = build_tester(
+        python_repository, (command,), executor,
+        observability=RecordingObservability(fail=True),
+    )
+
+    assert tester.run("Validar", changed_state("src/service.py")).status == "passed"
 
 
 def test_reports_timeout_and_respects_configured_limit(python_repository: Path) -> None:

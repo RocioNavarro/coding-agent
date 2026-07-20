@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Literal, Mapping
+from typing import Any, ClassVar, Literal, Mapping, Sequence
 from uuid import uuid4
 
 from core.models import EvidenceAssessment, ToolCall
@@ -296,6 +296,9 @@ class TaskState:
     _observations: list[str] = field(default_factory=list, repr=False)
     _evidence_assessment: EvidenceAssessment | None = field(default=None, repr=False)
     _evidence_assessment_plan: str | None = field(default=None, repr=False)
+    _planned_operations: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    _policy_preflight: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    _policy_approvals: list[str] = field(default_factory=list, repr=False)
 
     DEFAULT_STATUS: ClassVar[str] = "pending"
     DEFAULT_PHASE: ClassVar[str] = "intake"
@@ -359,6 +362,18 @@ class TaskState:
         return self._evidence_assessment
 
     @property
+    def planned_operations(self) -> tuple[dict[str, Any], ...]:
+        return tuple(deepcopy(self._planned_operations))
+
+    @property
+    def policy_preflight(self) -> tuple[dict[str, Any], ...]:
+        return tuple(deepcopy(self._policy_preflight))
+
+    @property
+    def policy_approvals(self) -> tuple[str, ...]:
+        return tuple(self._policy_approvals)
+
+    @property
     def has_current_sufficient_evidence(self) -> bool:
         return (
             self._evidence_assessment is not None
@@ -392,6 +407,19 @@ class TaskState:
             raise ValueError("No se puede evaluar evidencia sin un plan aprobado.")
         self._evidence_assessment = assessment
         self._evidence_assessment_plan = self.approved_plan
+
+    def record_planned_operations(self, operations: Sequence[Mapping[str, Any]]) -> None:
+        self._planned_operations = [
+            _require_mapping(item, "planned_operation") for item in operations
+        ]
+
+    def record_policy_preflight(self, decisions: Sequence[Mapping[str, Any]]) -> None:
+        self._policy_preflight = [
+            _require_mapping(item, "policy_preflight") for item in decisions
+        ]
+
+    def record_policy_approval(self, fingerprint: str) -> None:
+        self._append_unique(self._policy_approvals, fingerprint, "fingerprint")
 
     def _invalidate_evidence_assessment(self) -> None:
         self._evidence_assessment = None
@@ -468,6 +496,9 @@ class TaskState:
                 if self._evidence_assessment is not None else None
             ),
             "evidence_assessment_plan": self._evidence_assessment_plan,
+            "planned_operations": deepcopy(self._planned_operations),
+            "policy_preflight": deepcopy(self._policy_preflight),
+            "policy_approvals": list(self._policy_approvals),
             "final_result": self.final_result,
         }
 
@@ -523,6 +554,17 @@ class TaskState:
         )
         state._warnings.extend(cls._required_text_list(values, "warnings"))
         state._observations.extend(cls._required_text_list(values, "observations"))
+        state._planned_operations.extend(
+            _require_mapping(item, "planned_operation")
+            for item in cls._required_list(values, "planned_operations")
+        )
+        state._policy_preflight.extend(
+            _require_mapping(item, "policy_preflight")
+            for item in cls._required_list(values, "policy_preflight")
+        )
+        state._policy_approvals.extend(
+            cls._required_text_list(values, "policy_approvals")
+        )
         raw_assessment = values.get("evidence_assessment")
         if raw_assessment is not None:
             if not isinstance(raw_assessment, dict):

@@ -1,12 +1,19 @@
 """Integración del orquestador con subagentes simulados y estado real."""
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 from agents.orchestrator import MainAgent, TaskAnalysis
 from agents.project_memory import ProjectMemory
 from core.models import EvidenceAssessment, PlanReview
 from core.task_state import SourceReference, SubagentResult, TaskState
 from core.observability import ObservabilityEvent
+from core.progress import ProgressAssessment
+from core.planned_operations import (
+    PlannedOperation, PlannedOperationResult, PolicyPreflight,
+)
+from core.settings import AgentSettings
+from security.policy_engine import AgentToolPermissions, PolicyContext, PolicyEngine
 
 
 class FakeObservability:
@@ -128,11 +135,17 @@ class FakeImplementer:
 class FakeTesterResult:
     status: str
     summary: str
+    progress_assessments: tuple[ProgressAssessment, ...] = ()
 
 
 class FakeTester:
-    def __init__(self, statuses: tuple[str, ...] = ("passed",)) -> None:
+    def __init__(
+        self,
+        statuses: tuple[str, ...] = ("passed",),
+        progress_assessments: tuple[ProgressAssessment, ...] = (),
+    ) -> None:
         self.statuses = statuses
+        self.progress_assessments = progress_assessments
         self.calls = 0
 
     def run(self, instruction: str, state: TaskState, *args, **kwargs) -> FakeTesterResult:
@@ -142,7 +155,7 @@ class FakeTester:
         state.add_subagent_result(
             SubagentResult("tester", instruction, status, summary=summary, confidence=1.0)
         )
-        return FakeTesterResult(status, summary)
+        return FakeTesterResult(status, summary, self.progress_assessments)
 
 
 @dataclass
@@ -176,6 +189,7 @@ def build_agent(
     reviewer: FakeReviewer | None = None,
     max_iterations: int = 3,
     evidence_status: str = "sufficient",
+    review_analysis_tasks: bool = False,
 ) -> tuple[MainAgent, FakePlanner, FakeImplementer, FakeTester, FakeReviewer]:
     planner = FakePlanner()
     implementer = FakeImplementer(evidence_status)
@@ -190,12 +204,32 @@ def build_agent(
         tester=selected_tester,
         reviewer=selected_reviewer,
         max_iterations=max_iterations,
+        review_analysis_tasks=review_analysis_tasks,
     )
     return agent, planner, implementer, selected_tester, selected_reviewer
 
 
 def approve(_: str) -> PlanReview:
     return PlanReview("approve")
+
+
+def attach_preflight(
+    agent: MainAgent,
+    tmp_path,
+    *,
+    allowed_tools: frozenset[str] | None = None,
+    approval_tools: frozenset[str] = frozenset(),
+) -> None:
+    workspace = tmp_path / "preflight-workspace"
+    workspace.mkdir(exist_ok=True)
+    agent.policy_preflight = PolicyPreflight(
+        PolicyEngine(),
+        PolicyContext(
+            agent="main", workspace=workspace,
+            permissions=AgentToolPermissions(allowed_tools, approval_tools),
+            settings=AgentSettings(supervision_enabled=False),
+        ),
+    )
 
 
 def test_analysis_without_changes_selects_only_needed_agents() -> None:
@@ -208,6 +242,20 @@ def test_analysis_without_changes_selects_only_needed_agents() -> None:
     assert implementer.calls == tester.calls == reviewer.calls == 0
     assert result.task_state.files_modified == ()
     assert "Análisis completado sin cambios" in result.final_response
+
+
+def test_analysis_can_optionally_run_reviewer_without_implementation() -> None:
+    agent, _, implementer, tester, reviewer = build_agent(
+        kind="analysis", review_analysis_tasks=True
+    )
+
+    result = agent.run("Explicar la arquitectura", approve, task_id="review-analysis")
+
+    assert result.status == "completed"
+    assert result.selected_agents == ("explorer", "reviewer")
+    assert reviewer.calls == 1
+    assert implementer.calls == tester.calls == 0
+    assert result.task_state.files_modified == ()
 
 
 def test_change_runs_full_pipeline_after_approval() -> None:
@@ -234,9 +282,194 @@ def test_orchestrator_records_root_unique_agents_and_result() -> None:
     assert result.status == "completed"
     assert [event.event_type for event in observed.events].count("task") == 1
     assert [event.event_type for event in observed.events].count("result") == 1
-    names = [event.name for event in observed.events if event.event_type == "agent"]
+    names = [
+        event.name for event in observed.events
+        if event.event_type == "agent" and event.name != "evidence-sufficiency-policy"
+    ]
     assert names == ["explorer", "researcher", "implementer", "tester", "reviewer"]
     assert all(event.parent_event_id == "task:observed-task" for event in observed.events[1:])
+
+
+def test_evidence_assessment_is_observable_once_per_evaluation() -> None:
+    agent, _, implementer, _, _ = build_agent()
+    observed = FakeObservability()
+    agent.observability = observed
+
+    result = agent.run("Modificar con evidencia observable", approve, task_id="evidence-event")
+
+    events = [
+        event for event in observed.events
+        if event.name == "evidence-sufficiency-policy"
+    ]
+    assert result.status == "completed"
+    assert len(events) == implementer.assessment_calls == 1
+    assert events[0].payload == {
+        "status": "sufficient",
+        "blockers": (),
+        "missing_information": (),
+        "risks": (),
+        "recommended_action": "proceed",
+        "confidence": 1.0,
+        "task_id": "evidence-event",
+        "plan": "Plan 1 para Modificar con evidencia observable",
+    }
+
+
+def test_progress_recommendation_reaches_planner() -> None:
+    assessment = ProgressAssessment(
+        True, "command_error", "retry_with_new_strategy",
+        "Cambiar estrategia de validación.", 2,
+    )
+    tester = FakeTester(("failed", "passed"), (assessment,))
+    reviewer = FakeReviewer(("changes_requested", "approved"))
+    agent, planner, _, _, _ = build_agent(tester=tester, reviewer=reviewer)
+
+    result = agent.run("Corregir validación", approve)
+
+    assert result.status == "completed"
+    assert "Cambiar estrategia de validación." in planner.feedback[1]
+    assert any(
+        "ProgressMonitor recomendó retry_with_new_strategy" in item
+        for item in result.task_state.observations
+    )
+
+
+def test_progress_stop_blocks_before_reviewer_and_repetition() -> None:
+    assessment = ProgressAssessment(
+        True, "no_new_evidence", "stop", "Sin nueva evidencia.", 3
+    )
+    tester = FakeTester(("failed",), (assessment,))
+    reviewer = FakeReviewer()
+    agent, planner, implementer, _, _ = build_agent(
+        tester=tester, reviewer=reviewer, max_iterations=3
+    )
+
+    result = agent.run("Detener si no progresa", approve)
+
+    assert result.status == "blocked"
+    assert result.iterations == 1
+    assert reviewer.calls == 0
+    assert implementer.calls == 1
+    assert planner.feedback == [()]
+    assert result.final_response.startswith("Sin nueva evidencia.")
+
+
+def test_preflight_deny_blocks_before_implementer_and_records_state(tmp_path) -> None:
+    agent, _, implementer, tester, reviewer = build_agent()
+    observed = FakeObservability()
+    agent.observability = observed
+    attach_preflight(agent, tmp_path, allowed_tools=frozenset())
+
+    result = agent.run("Modificar con política", approve, task_id="preflight-deny")
+
+    assert result.status == "blocked"
+    assert implementer.calls == tester.calls == reviewer.calls == 0
+    assert result.task_state.planned_operations[0]["operation_type"] == "modify_file"
+    assert result.task_state.policy_preflight[0]["outcome"] == "deny"
+    assert any(event.name == "policy-preflight" for event in observed.events)
+
+
+def test_preflight_requires_exact_approval_before_continuing(tmp_path) -> None:
+    agent, _, implementer, _, _ = build_agent()
+    attach_preflight(
+        agent, tmp_path, approval_tools=frozenset({"write_file"})
+    )
+    requested = []
+
+    result = agent.run(
+        "Modificar aprobado", approve,
+        approve_operation=lambda operation: requested.append(operation) or True,
+    )
+
+    assert result.status == "completed"
+    assert implementer.calls == 1
+    assert len(requested) == 1
+    assert result.task_state.policy_approvals == (requested[0].fingerprint,)
+    assert result.task_state.policy_preflight[0]["outcome"] == "allow"
+
+
+def test_preflight_without_structured_intent_blocks_before_implementer(tmp_path) -> None:
+    class EmptyProvider:
+        def provide(self, approved_plan, state, explorer_results, proposal=None):
+            return PlannedOperationResult(
+                missing_information=("Falta intención estructurada.",), confidence=0.0
+            )
+
+    agent, _, implementer, tester, reviewer = build_agent()
+    agent.operation_provider = EmptyProvider()
+    attach_preflight(agent, tmp_path)
+
+    result = agent.run("Modificar sin intención", approve)
+
+    assert result.status == "blocked"
+    assert implementer.calls == tester.calls == reviewer.calls == 0
+    assert "insufficient_structured_intent" in result.final_response
+
+
+def test_observability_error_does_not_change_preflight_denial(tmp_path) -> None:
+    class FailingObservability:
+        def record(self, event):
+            raise RuntimeError("provider failed")
+
+        def flush(self):
+            return None
+
+    agent, _, implementer, _, _ = build_agent()
+    agent.observability = FailingObservability()
+    attach_preflight(agent, tmp_path, allowed_tools=frozenset())
+
+    result = agent.run("Modificar bloqueado", approve)
+
+    assert result.status == "blocked"
+    assert implementer.calls == 0
+
+
+def test_propose_only_can_supply_missing_structured_intent_once(tmp_path) -> None:
+    class ProposalAwareProvider:
+        def provide(self, approved_plan, state, explorer_results, proposal=None):
+            if proposal is None:
+                return PlannedOperationResult(
+                    missing_information=("Falta propuesta estructurada.",)
+                )
+            return PlannedOperationResult(
+                (
+                    PlannedOperation(
+                        "proposal-1", "modify_file", "implementer_propose_only",
+                        "src/app.txt", {"path": "src/app.txt", "new_text": "changed"},
+                        "plan-version",
+                    ),
+                ),
+                confidence=1.0,
+                provenance=("implementer_propose_only",),
+            )
+
+    class ProposalImplementer(FakeImplementer):
+        def __init__(self):
+            super().__init__()
+            self.modes = []
+
+        def run(self, instruction, state, *args, **kwargs):
+            mode = kwargs.get("mode")
+            self.modes.append(mode)
+            if mode == "propose_only":
+                return SimpleNamespace(changes=(SimpleNamespace(
+                    path="src/app.txt", old_text="old", new_text="changed",
+                    explanation="localized",
+                ),))
+            return super().run(instruction, state, *args, **kwargs)
+
+    agent, _, _, _, _ = build_agent()
+    implementer = ProposalImplementer()
+    agent.implementer = implementer
+    agent.operation_provider = ProposalAwareProvider()
+    agent.use_propose_only_for_intent = True
+    agent.max_intent_attempts = 1
+    attach_preflight(agent, tmp_path)
+
+    result = agent.run("Modificar con propuesta", approve)
+
+    assert result.status == "completed"
+    assert implementer.modes == ["propose_only", "apply_changes"]
 
 
 def test_rejected_plan_stops_before_changes() -> None:
