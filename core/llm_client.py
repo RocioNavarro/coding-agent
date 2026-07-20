@@ -7,7 +7,16 @@ import os
 from time import perf_counter
 from typing import Any, Protocol, Sequence
 
-from openai import OpenAI, OpenAIError
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AuthenticationError,
+    OpenAI,
+    OpenAIError,
+    PermissionDeniedError,
+    RateLimitError,
+)
 
 from core.models import LLMResponse, LLMUsage, Message, ToolCall
 from core.observability import (
@@ -52,6 +61,8 @@ class OpenAILLMClient:
         *,
         api_key: str | None = None,
         model: str | None = None,
+        timeout_seconds: float | None = None,
+        max_retries: int | None = None,
         client: Any | None = None,
     ) -> None:
         resolved_api_key = api_key or os.getenv("OPENAI_API_KEY")
@@ -61,12 +72,72 @@ class OpenAILLMClient:
         if not resolved_model:
             raise LLMConfigurationError("Falta la variable de entorno OPENAI_MODEL.")
 
+        self._timeout_seconds = self._resolve_timeout(timeout_seconds)
+        self._max_retries = self._resolve_max_retries(max_retries)
         self._model = resolved_model
-        self._client = client if client is not None else OpenAI(api_key=resolved_api_key)
+        self._client = (
+            client
+            if client is not None
+            else OpenAI(
+                api_key=resolved_api_key,
+                timeout=self._timeout_seconds,
+                max_retries=self._max_retries,
+            )
+        )
 
     @property
     def model_name(self) -> str:
         return self._model
+
+    @property
+    def timeout_seconds(self) -> float:
+        return self._timeout_seconds
+
+    @property
+    def max_retries(self) -> int:
+        return self._max_retries
+
+    @staticmethod
+    def _resolve_timeout(value: float | None) -> float:
+        raw: object = value
+        if raw is None:
+            raw = os.getenv("CODING_AGENT_LLM_TIMEOUT_SECONDS", "").strip() or 60
+        if isinstance(raw, bool):
+            raise LLMConfigurationError(
+                "CODING_AGENT_LLM_TIMEOUT_SECONDS debe ser un número mayor que cero."
+            )
+        try:
+            resolved = float(raw)
+        except (TypeError, ValueError) as error:
+            raise LLMConfigurationError(
+                "CODING_AGENT_LLM_TIMEOUT_SECONDS debe ser un número mayor que cero."
+            ) from error
+        if resolved <= 0:
+            raise LLMConfigurationError(
+                "CODING_AGENT_LLM_TIMEOUT_SECONDS debe ser un número mayor que cero."
+            )
+        return resolved
+
+    @staticmethod
+    def _resolve_max_retries(value: int | None) -> int:
+        raw: object = value
+        if raw is None:
+            raw = os.getenv("CODING_AGENT_LLM_MAX_RETRIES", "").strip() or 1
+        if isinstance(raw, bool):
+            raise LLMConfigurationError(
+                "CODING_AGENT_LLM_MAX_RETRIES debe ser un entero mayor o igual a cero."
+            )
+        try:
+            resolved = int(raw)
+        except (TypeError, ValueError) as error:
+            raise LLMConfigurationError(
+                "CODING_AGENT_LLM_MAX_RETRIES debe ser un entero mayor o igual a cero."
+            ) from error
+        if str(raw).strip() not in {str(resolved), f"+{resolved}"} or resolved < 0:
+            raise LLMConfigurationError(
+                "CODING_AGENT_LLM_MAX_RETRIES debe ser un entero mayor o igual a cero."
+            )
+        return resolved
 
     def complete(
         self,
@@ -84,8 +155,36 @@ class OpenAILLMClient:
         started_at = perf_counter()
         try:
             response = self._client.responses.create(**request)
+        except APITimeoutError as exc:
+            raise LLMProviderError(
+                "La llamada al modelo superó el límite configurado de "
+                f"{self._timeout_seconds:g} segundos."
+            ) from exc
+        except AuthenticationError as exc:
+            raise LLMProviderError("La API key de OpenAI fue rechazada.") from exc
+        except PermissionDeniedError as exc:
+            raise LLMProviderError(
+                "La cuenta no tiene acceso al modelo configurado."
+            ) from exc
+        except RateLimitError as exc:
+            raise LLMProviderError(
+                "La API rechazó la solicitud por límite de uso, cuota o saldo."
+            ) from exc
+        except APIStatusError as exc:
+            status = getattr(exc, "status_code", "desconocido")
+            request_id = getattr(exc, "request_id", None)
+            detail = f"; request ID: {request_id}" if request_id else ""
+            raise LLMProviderError(
+                f"La API de OpenAI devolvió HTTP {status}{detail}."
+            ) from exc
+        except APIConnectionError as exc:
+            raise LLMProviderError(
+                "No fue posible conectar con la API de OpenAI."
+            ) from exc
         except OpenAIError as exc:
-            raise LLMProviderError(f"Error del proveedor OpenAI: {exc}") from exc
+            raise LLMProviderError(
+                "La API de OpenAI produjo un error inesperado."
+            ) from exc
         latency_ms = (perf_counter() - started_at) * 1000
 
         return self._parse_response(response, latency_ms)

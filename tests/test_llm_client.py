@@ -3,8 +3,17 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import httpx
 import pytest
-from openai import APIConnectionError
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AuthenticationError,
+    OpenAIError,
+    PermissionDeniedError,
+    RateLimitError,
+)
 
 from core.llm_client import (
     LLMConfigurationError,
@@ -13,6 +22,13 @@ from core.llm_client import (
     OpenAILLMClient,
 )
 from core.models import LLMUsage, Message, ToolCall
+
+
+@pytest.fixture(autouse=True)
+def clear_llm_tuning_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Evita que la configuración local vuelva no deterministas estos tests."""
+    monkeypatch.delenv("CODING_AGENT_LLM_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("CODING_AGENT_LLM_MAX_RETRIES", raising=False)
 
 
 def make_response(*, output: list[object] | None = None, text: str = "Hola") -> object:
@@ -119,8 +135,129 @@ def test_provider_error_is_translated() -> None:
     sdk.responses.create.side_effect = APIConnectionError(request=Mock())
     client = OpenAILLMClient(api_key="test-key", model="gpt-test", client=sdk)
 
-    with pytest.raises(LLMProviderError, match="Error del proveedor OpenAI"):
+    with pytest.raises(LLMProviderError, match="No fue posible conectar"):
         client.complete([Message(role="user", content="Hola")])
+
+
+def test_default_timeout_and_retries() -> None:
+    client = OpenAILLMClient(api_key="test-key", model="gpt-test", client=Mock())
+
+    assert client.timeout_seconds == 60
+    assert client.max_retries == 1
+
+
+def test_timeout_and_retries_are_read_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODING_AGENT_LLM_TIMEOUT_SECONDS", "12.5")
+    monkeypatch.setenv("CODING_AGENT_LLM_MAX_RETRIES", "0")
+
+    client = OpenAILLMClient(api_key="test-key", model="gpt-test", client=Mock())
+
+    assert client.timeout_seconds == 12.5
+    assert client.max_retries == 0
+
+
+def test_empty_tuning_values_use_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CODING_AGENT_LLM_TIMEOUT_SECONDS", "")
+    monkeypatch.setenv("CODING_AGENT_LLM_MAX_RETRIES", "")
+
+    client = OpenAILLMClient(api_key="test-key", model="gpt-test", client=Mock())
+
+    assert client.timeout_seconds == 60
+    assert client.max_retries == 1
+
+
+@pytest.mark.parametrize("value", ["invalid", "0", "-2"])
+def test_invalid_timeout_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("CODING_AGENT_LLM_TIMEOUT_SECONDS", value)
+
+    with pytest.raises(LLMConfigurationError, match="LLM_TIMEOUT_SECONDS"):
+        OpenAILLMClient(api_key="test-key", model="gpt-test", client=Mock())
+
+
+@pytest.mark.parametrize("value", ["invalid", "1.5", "-1"])
+def test_invalid_max_retries_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("CODING_AGENT_LLM_MAX_RETRIES", value)
+
+    with pytest.raises(LLMConfigurationError, match="LLM_MAX_RETRIES"):
+        OpenAILLMClient(api_key="test-key", model="gpt-test", client=Mock())
+
+
+def test_sdk_receives_timeout_and_retries() -> None:
+    with patch("core.llm_client.OpenAI") as sdk_class:
+        OpenAILLMClient(
+            api_key="test-key",
+            model="gpt-test",
+            timeout_seconds=23,
+            max_retries=4,
+        )
+
+    sdk_class.assert_called_once_with(
+        api_key="test-key", timeout=23.0, max_retries=4
+    )
+
+
+def provider_exception(kind: str, secret: str = "secret-api-key") -> OpenAIError:
+    """Construye excepciones reales del SDK sin hacer solicitudes de red."""
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    if kind == "timeout":
+        return APITimeoutError(request)
+    if kind == "connection":
+        return APIConnectionError(message=secret, request=request)
+    response = httpx.Response(
+        401 if kind == "authentication" else 403,
+        request=request,
+        headers={"x-request-id": "req-safe-test"},
+    )
+    classes = {
+        "authentication": AuthenticationError,
+        "permission": PermissionDeniedError,
+        "rate": RateLimitError,
+        "status": APIStatusError,
+    }
+    if kind == "rate":
+        response.status_code = 429
+    if kind == "status":
+        response.status_code = 500
+    return classes[kind](secret, response=response, body=None)
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("timeout", "límite configurado de 60 segundos"),
+        ("connection", "No fue posible conectar"),
+        ("authentication", "API key de OpenAI fue rechazada"),
+        ("permission", "no tiene acceso al modelo"),
+        ("rate", "límite de uso, cuota o saldo"),
+        ("status", "HTTP 500; request ID: req-safe-test"),
+    ],
+)
+def test_sdk_errors_are_sanitized(kind: str, expected: str) -> None:
+    sdk = Mock()
+    sdk.responses.create.side_effect = provider_exception(kind)
+    client = OpenAILLMClient(api_key="test-key", model="gpt-test", client=sdk)
+
+    with pytest.raises(LLMProviderError, match=expected) as error:
+        client.complete([Message(role="user", content="Hola")])
+
+    assert "secret-api-key" not in str(error.value)
+
+
+def test_fallback_openai_error_is_sanitized() -> None:
+    sdk = Mock()
+    sdk.responses.create.side_effect = OpenAIError("secret-api-key")
+    client = OpenAILLMClient(api_key="test-key", model="gpt-test", client=sdk)
+
+    with pytest.raises(LLMProviderError, match="error inesperado") as error:
+        client.complete([Message(role="user", content="Hola")])
+
+    assert "secret-api-key" not in str(error.value)
 
 
 def test_reads_configuration_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:

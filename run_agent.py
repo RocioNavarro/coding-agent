@@ -32,6 +32,34 @@ from rag.retriever import RagRetriever
 from rag.vector_store import JsonVectorStore
 
 
+class ProgressTaskAnalyzer:
+    def __init__(self, delegate: LLMTaskAnalyzer) -> None:
+        self.delegate = delegate
+
+    def analyze(self, request: str):
+        print("[LLM] Analizando la tarea...", flush=True)
+        return self.delegate.analyze(request)
+
+
+class ProgressPlanGenerator:
+    def __init__(self, delegate: LLMPlanGenerator) -> None:
+        self.delegate = delegate
+
+    def generate(self, state, *, feedback=()):
+        print("[LLM] Generando el plan...", flush=True)
+        return self.delegate.generate(state, feedback=feedback)
+
+
+class ProgressRunner:
+    def __init__(self, delegate, message: str) -> None:
+        self.delegate = delegate
+        self.message = message
+
+    def run(self, *args, **kwargs):
+        print(self.message, flush=True)
+        return self.delegate.run(*args, **kwargs)
+
+
 def build_main_agent(
     settings: AgentSettings, observability: ObservabilityClient
 ) -> MainAgent:
@@ -78,10 +106,14 @@ def build_main_agent(
         )
 
     return MainAgent(
-        task_analyzer=LLMTaskAnalyzer(llm_client),
-        plan_generator=LLMPlanGenerator(llm_client),
-        explorer=explorer,
-        researcher=researcher,
+        task_analyzer=ProgressTaskAnalyzer(LLMTaskAnalyzer(llm_client)),
+        plan_generator=ProgressPlanGenerator(LLMPlanGenerator(llm_client)),
+        explorer=ProgressRunner(explorer, "[Explorer] Inspeccionando el repositorio..."),
+        researcher=(
+            ProgressRunner(researcher, "[Researcher] Consultando evidencia...")
+            if researcher is not None
+            else None
+        ),
         implementer=None,
         tester=None,
         reviewer=None,
@@ -127,11 +159,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         settings = AgentSettings.from_environment()
         observability = build_observability_client()
         agent = build_main_agent(settings, observability)
+        result = agent.run(args.request, interactive_plan_review)
+    except KeyboardInterrupt:
+        print("\nOperación cancelada por el usuario.", file=sys.stderr)
+        return 130
     except LLMClientError as error:
         print(f"Error de configuración del LLM: {error}", file=sys.stderr)
         return 1
-
-    result = agent.run(args.request, interactive_plan_review)
 
     print("\n=== Resultado ===")
     print(f"Estado: {result.status}")
