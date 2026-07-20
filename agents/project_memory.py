@@ -14,6 +14,7 @@ from typing import Any, Mapping, Sequence
 
 from agents.researcher import EvidenceFragment, ProjectMemoryProvider
 from core.task_state import TaskState
+from core.observability import NoOpObservabilityClient, ObservabilityClient, ObservabilityEvent, emit_observation
 
 
 MEMORY_SCHEMA_VERSION = 1
@@ -85,6 +86,7 @@ class ProjectMemory(ProjectMemoryProvider):
         *,
         identifier: str | None = None,
         storage_root: str | Path | None = None,
+        observability: ObservabilityClient | None = None,
     ) -> None:
         root = Path(workspace).resolve()
         if not root.is_dir():
@@ -98,6 +100,7 @@ class ProjectMemory(ProjectMemoryProvider):
         self.path = base / f"{self.workspace_id}.json"
         self._data = _empty_data(canonical, self.workspace_id)
         self._loaded = False
+        self.observability = observability or NoOpObservabilityClient()
 
     @staticmethod
     def _safe_identifier(identifier: str) -> str:
@@ -213,6 +216,15 @@ class ProjectMemory(ProjectMemoryProvider):
             },
             identity="task_id",
         )
+        emit_observation(
+            self.observability,
+            ObservabilityEvent(
+                "agent", "memory-summary-write", task_id=state.task_id,
+                payload={"status": state.current_status,
+                         "modified_file_count": len(state.files_modified),
+                         "error_count": len(state.errors)},
+            ),
+        )
 
     def search_relevant_memory(
         self, query: str, *, limit: int = 5
@@ -234,7 +246,7 @@ class ProjectMemory(ProjectMemoryProvider):
                 candidates.append((self._score(text, tokens), f"{field}/{index}", text))
         positive = [item for item in candidates if item[0] > 0]
         selected = sorted(positive, key=lambda item: (-item[0], item[1]))[:limit]
-        return tuple(
+        results = tuple(
             EvidenceFragment(
                 "project_memory",
                 f"memory://{self.workspace_id}/{reference}",
@@ -243,6 +255,15 @@ class ProjectMemory(ProjectMemoryProvider):
             )
             for score, reference, content in selected
         )
+        emit_observation(
+            self.observability,
+            ObservabilityEvent(
+                "agent", "memory-search",
+                payload={"query": query, "result_count": len(results),
+                         "used_entries": [item.reference for item in results]},
+            ),
+        )
+        return results
 
     def search(self, query: str, *, limit: int = 5) -> Sequence[EvidenceFragment]:
         """Implementa el contrato existente de ProjectMemoryProvider."""

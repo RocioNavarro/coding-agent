@@ -6,6 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Sequence
+from core.observability import NoOpObservabilityClient, ObservabilityClient, ObservabilityEvent, emit_observation
 
 
 ProgressRecommendation = Literal[
@@ -57,13 +58,17 @@ class ProgressAssessment:
 class ProgressMonitor:
     """Observa acciones normalizadas sin conocer lenguajes ni frameworks."""
 
-    def __init__(self, limits: ProgressLimits | None = None) -> None:
+    def __init__(
+        self, limits: ProgressLimits | None = None,
+        observability: ObservabilityClient | None = None,
+    ) -> None:
         self.limits = limits or ProgressLimits()
         self._last_signatures: dict[str, str] = {}
         self._repetitions: dict[str, int] = {}
         self._agents: list[str] = []
         self._known_evidence: set[str] = set()
         self._iterations_without_evidence = 0
+        self._observability = observability or NoOpObservabilityClient()
 
     def record_tool_call(
         self,
@@ -185,9 +190,22 @@ class ProgressMonitor:
             repetitions = 1
         self._last_signatures[kind] = signature
         self._repetitions[kind] = repetitions
-        if repetitions >= threshold:
-            return ProgressAssessment(True, kind, recommendation, reason, repetitions)
-        return ProgressAssessment(False)
+        assessment = (
+            ProgressAssessment(True, kind, recommendation, reason, repetitions)
+            if repetitions >= threshold else ProgressAssessment(False)
+        )
+        self._record_assessment(assessment)
+        return assessment
+
+    def _record_assessment(self, assessment: ProgressAssessment) -> None:
+        emit_observation(
+            self._observability,
+            ObservabilityEvent(
+                "iteration", "progress-assessment",
+                payload={**assessment.to_dict(),
+                         "repetition_detected": assessment.detected},
+            ),
+        )
 
     def _reset(self, kind: str) -> None:
         self._last_signatures.pop(kind, None)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from time import perf_counter
 from dataclasses import dataclass
 from collections.abc import Callable
 from typing import Literal, Protocol, Sequence
@@ -20,6 +21,10 @@ from agents.tester import TesterResult
 from core.llm_client import LLMClient
 from core.models import EvidenceAssessment, Message, PlanReview
 from core.task_state import ErrorRecord, SourceReference, SubagentResult, TaskState
+from core.observability import (
+    NoOpObservabilityClient, ObservabilityClient, ObservabilityEvent,
+    emit_observation, observation_context,
+)
 
 
 TaskKind = Literal["analysis", "change"]
@@ -226,6 +231,7 @@ class MainAgent:
         presenter: ResultPresenter | None = None,
         max_iterations: int = 3,
         minimum_evidence_confidence: float = 0.5,
+        observability: ObservabilityClient | None = None,
     ) -> None:
         if max_iterations < 1:
             raise ValueError("max_iterations debe ser al menos 1.")
@@ -243,6 +249,8 @@ class MainAgent:
         self.max_iterations = max_iterations
         self.minimum_evidence_confidence = minimum_evidence_confidence
         self._memory_available = True
+        self.observability = observability or NoOpObservabilityClient()
+        self._task_started = 0.0
 
     def run(
         self,
@@ -252,6 +260,17 @@ class MainAgent:
         task_id: str | None = None,
     ) -> OrchestrationResult:
         state = TaskState.create(request, task_id=task_id)
+        self._task_started = perf_counter()
+        root_id = f"task:{state.task_id}"
+        emit_observation(
+            self.observability,
+            ObservabilityEvent(
+                "task", "orchestrated-task", event_id=root_id,
+                task_id=state.task_id,
+                payload={"request": request, "phase": "analysis",
+                         "project": {"kind": "repository"}},
+            ),
+        )
         selected: list[str] = []
         self._memory_available = True
         try:
@@ -265,16 +284,26 @@ class MainAgent:
             )
 
             state.set_phase("exploration")
-            self.explorer.run(request, state)
+            with observation_context(
+                task_id=state.task_id,
+                parent_event_id=f"{state.task_id}:explorer:0", agent="explorer",
+            ):
+                self.explorer.run(request, state)
             selected.append("explorer")
+            self._record_agent(state, "explorer", 0)
 
             needs_research = analysis.research_required or analysis.kind == "change"
             if needs_research:
                 if self.researcher is None:
                     return self._blocked(state, selected, 0, "Researcher no está configurado.")
                 state.set_phase("research")
-                research = self.researcher.run(request, state)
+                with observation_context(
+                    task_id=state.task_id,
+                    parent_event_id=f"{state.task_id}:researcher:0", agent="researcher",
+                ):
+                    research = self.researcher.run(request, state)
                 selected.append("researcher")
+                self._record_agent(state, "researcher", 0)
                 if (
                     research.subagent_result.status != "completed"
                     or research.confidence < self.minimum_evidence_confidence
@@ -318,9 +347,13 @@ class MainAgent:
                     )
 
                 state.set_phase("evidence_assessment")
-                assessment = self.implementer.assess_evidence(
-                    request, state, validation_available=self.tester is not None
-                )
+                with observation_context(
+                    task_id=state.task_id,
+                    parent_event_id=f"task:{state.task_id}", agent="main",
+                ):
+                    assessment = self.implementer.assess_evidence(
+                        request, state, validation_available=self.tester is not None
+                    )
                 state.record_evidence_assessment(assessment)
                 if assessment.status == "partial":
                     missing_evidence = set(assessment.missing_information)
@@ -329,16 +362,32 @@ class MainAgent:
                         "archivos objetivo", "archivos objetivo existentes",
                     }:
                         state.set_phase("exploration")
-                        self.explorer.run(request, state)
+                        with observation_context(
+                            task_id=state.task_id,
+                            parent_event_id=f"{state.task_id}:explorer:{iteration}",
+                            agent="explorer",
+                        ):
+                            self.explorer.run(request, state)
                         selected.append("explorer")
+                        self._record_agent(state, "explorer", iteration)
                     if "fuentes de respaldo" in missing_evidence and self.researcher is not None:
                         state.set_phase("research")
-                        self.researcher.run(request, state)
+                        with observation_context(
+                            task_id=state.task_id,
+                            parent_event_id=f"{state.task_id}:researcher:{iteration}",
+                            agent="researcher",
+                        ):
+                            self.researcher.run(request, state)
                         selected.append("researcher")
+                        self._record_agent(state, "researcher", iteration)
                     state.set_phase("evidence_assessment")
-                    assessment = self.implementer.assess_evidence(
-                        request, state, validation_available=self.tester is not None
-                    )
+                    with observation_context(
+                        task_id=state.task_id,
+                        parent_event_id=f"task:{state.task_id}", agent="main",
+                    ):
+                        assessment = self.implementer.assess_evidence(
+                            request, state, validation_available=self.tester is not None
+                        )
                     state.record_evidence_assessment(assessment)
                 if assessment.status != "sufficient":
                     return self._blocked(
@@ -361,10 +410,16 @@ class MainAgent:
                     )
 
                 state.set_phase("implementation")
-                implementation = self.implementer.run(
-                    request, state, mode="apply_changes"
-                )
+                with observation_context(
+                    task_id=state.task_id,
+                    parent_event_id=f"{state.task_id}:implementer:{iteration}",
+                    agent="implementer",
+                ):
+                    implementation = self.implementer.run(
+                        request, state, mode="apply_changes"
+                    )
                 selected.append("implementer")
+                self._record_agent(state, "implementer", iteration)
                 if not implementation.files_modified:
                     return self._blocked(
                         state, selected, iteration,
@@ -373,13 +428,23 @@ class MainAgent:
 
                 state.set_phase("testing")
                 assert self.tester is not None
-                testing = self.tester.run("Validar los cambios aplicados", state)
+                with observation_context(
+                    task_id=state.task_id,
+                    parent_event_id=f"{state.task_id}:tester:{iteration}", agent="tester",
+                ):
+                    testing = self.tester.run("Validar los cambios aplicados", state)
                 selected.append("tester")
+                self._record_agent(state, "tester", iteration)
 
                 state.set_phase("review")
                 assert self.reviewer is not None
-                review = self.reviewer.run("Revisar el resultado completo", state)
+                with observation_context(
+                    task_id=state.task_id,
+                    parent_event_id=f"{state.task_id}:reviewer:{iteration}", agent="reviewer",
+                ):
+                    review = self.reviewer.run("Revisar el resultado completo", state)
                 selected.append("reviewer")
+                self._record_agent(state, "reviewer", iteration)
                 if review.decision == "approved" and testing.status == "passed":
                     state.set_status("completed")
                     state.set_phase("finalization")
@@ -480,6 +545,40 @@ class MainAgent:
                 )
                 state.add_warning("No se pudo persistir el resumen de la tarea.")
         final = self.presenter.present(state)
+        emit_observation(
+            self.observability,
+            ObservabilityEvent(
+                "result", "orchestrated-task-finished", task_id=state.task_id,
+                parent_event_id=f"task:{state.task_id}",
+                payload={"status": status, "result": state.final_result,
+                         "files_modified": state.files_modified,
+                         "iterations": iterations, "error_count": len(state.errors),
+                         "sources": [source.reference for source in state.sources]},
+                latency_ms=(perf_counter() - self._task_started) * 1000,
+                estimated_cost=None,
+            ),
+        )
         return OrchestrationResult(
             status, state, final, iterations, tuple(dict.fromkeys(selected))
+        )
+
+    def _record_agent(self, state: TaskState, name: str, iteration: int) -> None:
+        result = next(
+            (item for item in reversed(state.subagent_results)
+             if item.subagent_id == name), None
+        )
+        if result is None:
+            return
+        emit_observation(
+            self.observability,
+            ObservabilityEvent(
+                "agent", name, event_id=f"{state.task_id}:{name}:{iteration}",
+                parent_event_id=f"task:{state.task_id}", task_id=state.task_id,
+                agent=name,
+                payload={"phase": state.current_phase, "iteration": iteration,
+                         "input": state.original_request,
+                         "output": result.summary or result.result,
+                         "status": result.status, "blockers": result.blockers,
+                         "confidence": result.confidence, "error": result.error},
+            ),
         )

@@ -5,9 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
+from time import perf_counter
 
 from agents.researcher import EvidenceFragment, WebSearchProvider
 from tools.web_tools import WebSearchResult, web_search
+from core.observability import NoOpObservabilityClient, ObservabilityClient, ObservabilityEvent, emit_observation
 
 
 SearchBackend = Callable[[str, int], Sequence[WebSearchResult]]
@@ -107,10 +109,12 @@ class ConfiguredWebSearchProvider(WebSearchProvider):
         config: WebSearchConfig | None = None,
         *,
         backend: SearchBackend = web_search,
+        observability: ObservabilityClient | None = None,
     ) -> None:
         self.config = config or WebSearchConfig()
         self.backend = backend
         self.last_trace: WebSearchTrace | None = None
+        self.observability = observability or NoOpObservabilityClient()
 
     def search(self, query: str, *, limit: int = 5) -> Sequence[EvidenceFragment]:
         return self.search_context(query, limit=limit)
@@ -123,6 +127,7 @@ class ConfiguredWebSearchProvider(WebSearchProvider):
         technologies: Sequence[str] = (),
         rag_metadata: Sequence[Mapping[str, Any]] = (),
     ) -> Sequence[EvidenceFragment]:
+        started = perf_counter()
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query no puede estar vacía.")
         effective_limit = min(max(1, limit), self.config.max_results)
@@ -151,6 +156,21 @@ class ConfiguredWebSearchProvider(WebSearchProvider):
             f"Se utilizaron {len(used)} resultados tras filtros y deduplicación.",
         )
         self.last_trace = WebSearchTrace(query.strip(), tuple(executed), found, used, conclusions)
+        emit_observation(
+            self.observability,
+            ObservabilityEvent(
+                "web", "web-search",
+                payload={"query": query.strip(),
+                         "priority_domains": priorities,
+                         "allowed_domains": self.config.allowed_domains,
+                         "blocked_domains": self.config.blocked_domains,
+                         "result_count": len(found),
+                         "used_results": [item.url for item in used],
+                         "fallback_reason": "insufficient_priority_results" if len(executed) > 1 else None,
+                         "available": True},
+                latency_ms=(perf_counter() - started) * 1000,
+            ),
+        )
         return tuple(
             EvidenceFragment("web", item.url, f"{item.title}\n{item.snippet}", 0.8 if item.priority else 0.6)
             for item in used

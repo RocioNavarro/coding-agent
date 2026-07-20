@@ -3,6 +3,18 @@
 from typing import Any
 
 from agents.web_research import ConfiguredWebSearchProvider, WebSearchConfig
+from core.observability import ObservabilityEvent
+
+
+class FakeObservability:
+    def __init__(self) -> None:
+        self.events: list[ObservabilityEvent] = []
+
+    def record(self, event: ObservabilityEvent) -> None:
+        self.events.append(event)
+
+    def flush(self) -> None:
+        return None
 
 
 class FakeBackend:
@@ -125,6 +137,21 @@ def test_trace_records_query_url_title_fragment_found_and_used() -> None:
     }
     assert audit["used"] == audit["found"]
     assert audit["conclusions"]
+
+
+def test_records_web_filters_results_and_fallback() -> None:
+    observed = FakeObservability()
+    provider = ConfiguredWebSearchProvider(
+        WebSearchConfig(allowed_domains=("docs.test",), max_results=1),
+        backend=FakeBackend([result("Doc", "https://docs.test/item")]),
+        observability=observed,
+    )
+
+    provider.search("query", limit=1)
+
+    assert len(observed.events) == 1
+    assert observed.events[0].payload["result_count"] == 1
+    assert observed.events[0].payload["allowed_domains"] == ("docs.test",)
 
 
 def test_config_from_dict_normalizes_all_dynamic_options() -> None:

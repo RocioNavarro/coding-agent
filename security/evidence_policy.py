@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from core.models import EvidenceAssessment
+from core.observability import NoOpObservabilityClient, ObservabilityClient, ObservabilityEvent, emit_observation
 
 
 RiskLevel = Literal["low", "moderate", "high", "excessive"]
@@ -58,6 +59,9 @@ class EvidenceContext:
 class EvidenceSufficiencyPolicy:
     """Clasifica evidencia y recomienda una acción sin ejecutar modificaciones."""
 
+    def __init__(self, observability: ObservabilityClient | None = None) -> None:
+        self._observability = observability or NoOpObservabilityClient()
+
     def evaluate(self, context: EvidenceContext) -> EvidenceAssessment:
         if not isinstance(context, EvidenceContext):
             raise TypeError("context debe ser una instancia de EvidenceContext.")
@@ -97,7 +101,7 @@ class EvidenceSufficiencyPolicy:
             blockers.append("El riesgo evaluado es excesivo.")
 
         if blockers:
-            return EvidenceAssessment(
+            assessment = EvidenceAssessment(
                 status="insufficient",
                 supporting_sources=context.supporting_sources,
                 missing_information=tuple(dict.fromkeys(missing)),
@@ -105,6 +109,8 @@ class EvidenceSufficiencyPolicy:
                 recommended_action="request_help" if request_help else "stop",
                 confidence=1.0,
             )
+            self._record(assessment)
+            return assessment
 
         if not context.conventions:
             missing.append("convenciones del componente")
@@ -115,7 +121,7 @@ class EvidenceSufficiencyPolicy:
         if not context.target_files:
             missing.append("archivos objetivo")
         if missing:
-            return EvidenceAssessment(
+            assessment = EvidenceAssessment(
                 status="partial",
                 supporting_sources=context.supporting_sources,
                 missing_information=tuple(missing),
@@ -123,12 +129,29 @@ class EvidenceSufficiencyPolicy:
                 recommended_action="gather_more_evidence",
                 confidence=0.5,
             )
+            self._record(assessment)
+            return assessment
 
-        return EvidenceAssessment(
+        assessment = EvidenceAssessment(
             status="sufficient",
             supporting_sources=context.supporting_sources,
             missing_information=(),
             risks=context.risks,
             recommended_action="proceed",
             confidence=1.0,
+        )
+        self._record(assessment)
+        return assessment
+
+    def _record(self, assessment: EvidenceAssessment) -> None:
+        emit_observation(
+            self._observability,
+            ObservabilityEvent(
+                "agent", "evidence-assessment",
+                payload={"decision": assessment.status,
+                         "reasons": assessment.missing_information,
+                         "risks": assessment.risks,
+                         "recommended_action": assessment.recommended_action,
+                         "confidence": assessment.confidence},
+            ),
         )

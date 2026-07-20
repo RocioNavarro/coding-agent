@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from time import perf_counter
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -10,6 +11,7 @@ from agents.researcher import EvidenceFragment, KnowledgeRetriever
 from rag.embeddings import EmbeddingProvider
 from rag.models import ChunkMetadata, DocumentChunk
 from rag.vector_store import VectorStore
+from core.observability import NoOpObservabilityClient, ObservabilityClient, ObservabilityEvent, emit_observation
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,7 @@ class RagRetriever(KnowledgeRetriever):
         min_chunks_for_sufficiency: int = 1,
         min_documents_for_sufficiency: int = 1,
         default_filters: Mapping[str, str | Sequence[str]] | None = None,
+        observability: ObservabilityClient | None = None,
     ) -> None:
         if top_k < 1:
             raise ValueError("top_k debe ser positivo.")
@@ -90,6 +93,7 @@ class RagRetriever(KnowledgeRetriever):
         self.min_documents = min_documents_for_sufficiency
         self.default_filters = self._normalize_filters(default_filters or {})
         self.last_trace: RagRetrievalTrace | None = None
+        self.observability = observability or NoOpObservabilityClient()
 
     def retrieve(self, query: str, *, limit: int = 5) -> Sequence[EvidenceFragment]:
         return self.retrieve_filtered(query, filters=None, limit=limit)
@@ -121,6 +125,7 @@ class RagRetriever(KnowledgeRetriever):
         filters: Mapping[str, str | Sequence[str]] | None = None,
         top_k: int | None = None,
     ) -> RagRetrievalTrace:
+        started = perf_counter()
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query no puede estar vacía.")
         limit = top_k if top_k is not None else self.top_k
@@ -158,6 +163,23 @@ class RagRetriever(KnowledgeRetriever):
             conclusions, sufficiency,
         )
         self.last_trace = trace
+        emit_observation(
+            self.observability,
+            ObservabilityEvent(
+                "rag", "rag-retrieval",
+                payload={"query": trace.query, "top_k": limit,
+                         "filters": trace.filters,
+                         "retrieved_chunks": [item.chunk_id for item in trace.retrieved_chunks],
+                         "used_chunks": [item.chunk_id for item in trace.used_chunks],
+                         "scores": {item.chunk_id: item.score for item in trace.retrieved_chunks},
+                         "documents": trace.documents,
+                         "sections": [item.metadata.section for item in trace.used_chunks],
+                         "sufficiency": {"sufficient": sufficiency.sufficient,
+                                         "confidence": sufficiency.confidence,
+                                         "reasons": sufficiency.reasons}},
+                latency_ms=(perf_counter() - started) * 1000,
+            ),
+        )
         return trace
 
     def retrieval_audit(self) -> Mapping[str, Any] | None:

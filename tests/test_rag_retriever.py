@@ -7,6 +7,18 @@ from rag.embeddings import EmbeddingProvider
 from rag.models import ChunkMetadata, DocumentChunk
 from rag.retriever import RagRetriever
 from rag.vector_store import JsonVectorStore
+from core.observability import ObservabilityEvent
+
+
+class FakeObservability:
+    def __init__(self) -> None:
+        self.events: list[ObservabilityEvent] = []
+
+    def record(self, event: ObservabilityEvent) -> None:
+        self.events.append(event)
+
+    def flush(self) -> None:
+        return None
 
 
 class QueryEmbedding(EmbeddingProvider):
@@ -83,6 +95,25 @@ def test_retrieves_top_k_with_scores_and_metadata(tmp_path: Path) -> None:
     assert [item.relevance for item in evidence] == [1.0, 0.8]
     assert evidence[0].reference == "rag://doc-a/0"
     assert embeddings.queries == ["target query"]
+
+
+def test_records_compact_rag_observation(tmp_path: Path) -> None:
+    observed = FakeObservability()
+    retriever = RagRetriever(
+        embedding_provider=QueryEmbedding({"query": (1.0, 0.0)}),
+        vector_store=store_with(
+            tmp_path, chunk("chunk-a", "doc-a", "full content", (1.0, 0.0))
+        ),
+        observability=observed,
+    )
+
+    retriever.retrieve_context("query", top_k=1)
+
+    assert len(observed.events) == 1
+    payload = observed.events[0].payload
+    assert payload["retrieved_chunks"] == ["chunk-a"]
+    assert payload["documents"] == ("doc-a",)
+    assert "full content" not in str(payload)
 
 
 def test_applies_dynamic_metadata_and_tag_filters(tmp_path: Path) -> None:

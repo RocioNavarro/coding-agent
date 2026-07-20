@@ -6,6 +6,18 @@ from agents.orchestrator import MainAgent, TaskAnalysis
 from agents.project_memory import ProjectMemory
 from core.models import EvidenceAssessment, PlanReview
 from core.task_state import SourceReference, SubagentResult, TaskState
+from core.observability import ObservabilityEvent
+
+
+class FakeObservability:
+    def __init__(self) -> None:
+        self.events: list[ObservabilityEvent] = []
+
+    def record(self, event: ObservabilityEvent) -> None:
+        self.events.append(event)
+
+    def flush(self) -> None:
+        return None
 
 
 class FakeAnalyzer:
@@ -210,6 +222,21 @@ def test_change_runs_full_pipeline_after_approval() -> None:
     assert implementer.calls == tester.calls == reviewer.calls == 1
     assert result.task_state.approved_plan == "Plan 1 para Modificar el comportamiento"
     assert "[utilizado:rag] knowledge://evidence" in result.final_response
+
+
+def test_orchestrator_records_root_unique_agents_and_result() -> None:
+    agent, _, _, _, _ = build_agent()
+    observed = FakeObservability()
+    agent.observability = observed
+
+    result = agent.run("Modificar observado", approve, task_id="observed-task")
+
+    assert result.status == "completed"
+    assert [event.event_type for event in observed.events].count("task") == 1
+    assert [event.event_type for event in observed.events].count("result") == 1
+    names = [event.name for event in observed.events if event.event_type == "agent"]
+    assert names == ["explorer", "researcher", "implementer", "tester", "reviewer"]
+    assert all(event.parent_event_id == "task:observed-task" for event in observed.events[1:])
 
 
 def test_rejected_plan_stops_before_changes() -> None:

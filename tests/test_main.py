@@ -10,7 +10,9 @@ import pytest
 
 import main as main_module
 from core.models import LLMResponse, LLMUsage, Message
+from core.llm_client import ObservedLLMClient
 from core.settings import AgentSettings
+from core.observability import ObservabilityEvent
 from main import CommandResult, load_environment, process_command, run_chat
 from tools.registry import ToolRegistry
 from tools.definitions import ToolDefinition
@@ -41,6 +43,17 @@ class FakeLLMClient:
             usage=LLMUsage(1, 1, 2),
             latency_ms=1.0,
         )
+
+
+class FakeObservability:
+    def __init__(self) -> None:
+        self.events: list[ObservabilityEvent] = []
+
+    def record(self, event: ObservabilityEvent) -> None:
+        self.events.append(event)
+
+    def flush(self) -> None:
+        return None
 
 
 def scripted_input(values: list[object]):
@@ -80,6 +93,23 @@ def test_chat_keeps_history_across_multiple_turns() -> None:
     assert "Primera respuesta" in output
     assert "Segunda respuesta" in output
     assert output.count("Iteraciones del turno: 1") == 2
+
+
+def test_chat_creates_and_closes_one_task_trace() -> None:
+    observed = FakeObservability()
+
+    run_chat(
+        FakeLLMClient(["done"]), ToolRegistry(),
+        AgentSettings(plan_mode_enabled=False),
+        input_func=scripted_input(["password=hunter2", "/exit"]),
+        output=lambda _: None, observability=observed,
+    )
+
+    task_events = [event for event in observed.events if event.event_type == "task"]
+    result_events = [event for event in observed.events if event.event_type == "result"]
+    assert len(task_events) == len(result_events) == 1
+    assert result_events[0].parent_event_id == task_events[0].event_id
+    assert "hunter2" not in str(task_events[0].payload)
 
 
 def test_empty_messages_are_ignored() -> None:
@@ -314,19 +344,25 @@ def test_loop_error_is_shown_without_traceback_and_chat_continues() -> None:
 def test_main_builds_dependencies_and_starts_chat() -> None:
     fake_client = Mock()
     fake_registry = Mock()
+    fake_observability = FakeObservability()
     with (
         patch.object(main_module, "OpenAILLMClient", return_value=fake_client),
         patch.object(main_module, "build_default_registry", return_value=fake_registry),
         patch.object(main_module, "load_environment") as load_env,
         patch.object(main_module, "run_chat") as chat,
+        patch.object(
+            main_module, "build_observability_client",
+            return_value=fake_observability,
+        ),
     ):
         main_module.main()
 
     load_env.assert_called_once_with()
     chat.assert_called_once()
     args = chat.call_args.args
-    assert args[0] is fake_client
+    assert isinstance(args[0], ObservedLLMClient)
     assert args[1] is fake_registry
+    assert chat.call_args.kwargs["observability"] is fake_observability
     assert isinstance(args[2], AgentSettings)
 
 

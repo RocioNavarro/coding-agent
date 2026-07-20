@@ -10,6 +10,9 @@ from typing import Any, Protocol, Sequence
 from openai import OpenAI, OpenAIError
 
 from core.models import LLMResponse, LLMUsage, Message, ToolCall
+from core.observability import (
+    NoOpObservabilityClient, ObservabilityClient, ObservabilityEvent, emit_observation,
+)
 
 
 class LLMClientError(RuntimeError):
@@ -59,6 +62,10 @@ class OpenAILLMClient:
 
         self._model = resolved_model
         self._client = client if client is not None else OpenAI(api_key=resolved_api_key)
+
+    @property
+    def model_name(self) -> str:
+        return self._model
 
     def complete(
         self,
@@ -196,3 +203,83 @@ class OpenAILLMClient:
             raise LLMInvalidResponseError(
                 "OpenAI devolvió una respuesta con formato inválido."
             ) from exc
+
+
+class ObservedLLMClient:
+    """Instrumenta una única vez cualquier implementación de LLMClient."""
+
+    def __init__(
+        self,
+        client: LLMClient,
+        observability: ObservabilityClient | None = None,
+    ) -> None:
+        self._client = client
+        self._observability = observability or NoOpObservabilityClient()
+        self._task_id: str | None = None
+        self._parent_event_id: str | None = None
+        self._agent: str | None = None
+        self._usage = LLMUsage(0, 0, 0)
+
+    @property
+    def model_name(self) -> str | None:
+        value = getattr(self._client, "model_name", None)
+        return value if isinstance(value, str) else None
+
+    @property
+    def total_usage(self) -> LLMUsage:
+        return self._usage
+
+    def set_observation_context(
+        self, *, task_id: str | None, parent_event_id: str | None, agent: str | None = None
+    ) -> None:
+        self._task_id = task_id
+        self._parent_event_id = parent_event_id
+        self._agent = agent
+        self._usage = LLMUsage(0, 0, 0)
+
+    def complete(
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[dict[str, Any]] = (),
+    ) -> LLMResponse:
+        started = perf_counter()
+        prompt = [
+            {"role": message.role, "content": message.content}
+            for message in messages
+        ]
+        try:
+            response = self._client.complete(messages, tools)
+        except Exception as error:
+            emit_observation(
+                self._observability,
+                ObservabilityEvent(
+                    "llm_call", "llm-error", task_id=self._task_id,
+                    parent_event_id=self._parent_event_id, agent=self._agent,
+                    payload={"prompt": prompt, "error": str(error)},
+                    latency_ms=(perf_counter() - started) * 1000,
+                ),
+            )
+            raise
+        emit_observation(
+            self._observability,
+            ObservabilityEvent(
+                "llm_call", "llm-completion", task_id=self._task_id,
+                parent_event_id=self._parent_event_id, agent=self._agent,
+                model=response.model,
+                payload={
+                    "prompt": prompt, "response": response.text,
+                    "tool_calls": [call.name for call in response.tool_calls],
+                },
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+                total_tokens=response.usage.total_tokens,
+                latency_ms=response.latency_ms,
+                estimated_cost=None,
+            ),
+        )
+        self._usage = LLMUsage(
+            self._usage.input_tokens + response.usage.input_tokens,
+            self._usage.output_tokens + response.usage.output_tokens,
+            self._usage.total_tokens + response.usage.total_tokens,
+        )
+        return response

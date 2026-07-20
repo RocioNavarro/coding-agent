@@ -6,9 +6,11 @@ import json
 import re
 from collections.abc import Callable
 from typing import Any
+from time import perf_counter
 
 from core.llm_client import LLMClient
 from core.models import InternalLoopResult, Message, PlanningResult, PlanReview
+from core.observability import NoOpObservabilityClient, ObservabilityClient, ObservabilityEvent, emit_observation
 from core.progress import ProgressAssessment, ProgressMonitor
 from core.settings import AgentSettings
 from core.supervision import ConfirmationCallback, SupervisedToolExecutor
@@ -98,10 +100,17 @@ def run_internal_loop(
     confirm: ConfirmationCallback | None = None,
     output: OutputCallback = print,
     progress_monitor: ProgressMonitor | None = None,
+    observability: ObservabilityClient | None = None,
+    task_id: str | None = None,
+    parent_event_id: str | None = None,
 ) -> InternalLoopResult:
     """Ejecuta tool calling hasta obtener texto final o agotar el límite."""
-    executor = SupervisedToolExecutor(tool_registry, settings, confirm)
-    progress = progress_monitor or ProgressMonitor()
+    observed = observability or NoOpObservabilityClient()
+    executor = SupervisedToolExecutor(
+        tool_registry, settings, confirm, observability=observed,
+        task_id=task_id, parent_event_id=parent_event_id,
+    )
+    progress = progress_monitor or ProgressMonitor(observability=observed)
 
     for iteration in range(1, settings.max_iterations + 1):
         output(_format_iteration_heading(iteration))
@@ -146,6 +155,16 @@ def run_internal_loop(
             )
 
         iteration_assessment = progress.record_iteration(evidence=iteration_evidence)
+        emit_observation(
+            observed,
+            ObservabilityEvent(
+                "iteration", "internal-loop", task_id=task_id,
+                parent_event_id=parent_event_id,
+                payload={"iteration": iteration,
+                         "progress": iteration_assessment.to_dict(),
+                         "repetition_detected": iteration_assessment.detected},
+            ),
+        )
         if iteration_assessment.detected:
             _report_progress(iteration_assessment, output)
             history.append(

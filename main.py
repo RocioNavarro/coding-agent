@@ -5,14 +5,20 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
+from uuid import uuid4
 from typing import Any
 
 from dotenv import load_dotenv
 
 from core.harness import run_internal_loop, run_planning_loop
-from core.llm_client import LLMClient, LLMClientError, OpenAILLMClient
+from core.llm_client import LLMClient, LLMClientError, ObservedLLMClient, OpenAILLMClient
 from core.models import Message, PlanReview
 from core.settings import AgentSettings
+from core.observability import (
+    NoOpObservabilityClient, ObservabilityClient, ObservabilityEvent,
+    build_observability_client, emit_observation,
+)
 from core.supervision import ConfirmationCallback
 from tools.definitions import ToolDefinition
 from tools.registry import ToolRegistry, build_default_registry
@@ -78,11 +84,13 @@ def run_chat(
     input_func: InputCallback = input,
     output: OutputCallback = print,
     confirm: ConfirmationCallback | None = None,
+    observability: ObservabilityClient | None = None,
 ) -> list[Message]:
     """Ejecuta el loop externo y devuelve el historial al finalizar."""
     history = [Message(role="system", content=SYSTEM_PROMPT)]
     approval = confirm or _interactive_confirmation(input_func, output)
     plan_review = _interactive_plan_review(input_func, output)
+    observed = observability or NoOpObservabilityClient()
 
     while True:
         try:
@@ -106,6 +114,22 @@ def run_chat(
             continue
 
         history.append(Message(role="user", content=message))
+        task_id = str(uuid4())
+        root_id = f"task:{task_id}"
+        started = perf_counter()
+        emit_observation(
+            observed,
+            ObservabilityEvent(
+                "task", "coding-agent-task", event_id=root_id, task_id=task_id,
+                model=(llm_client.model_name if isinstance(llm_client, ObservedLLMClient) else None),
+                payload={"request": message, "phase": "intake",
+                         "project": {"workspace": "workspace"}},
+            ),
+        )
+        if isinstance(llm_client, ObservedLLMClient):
+            llm_client.set_observation_context(
+                task_id=task_id, parent_event_id=root_id, agent="main"
+            )
         try:
             if settings.plan_mode_enabled:
                 planning = run_planning_loop(
@@ -146,6 +170,9 @@ def run_chat(
                 history,
                 approval,
                 output,
+                observability=observed,
+                task_id=task_id,
+                parent_event_id=root_id,
             )
         except KeyboardInterrupt:
             output("\nInterrumpido por el usuario.")
@@ -154,12 +181,42 @@ def run_chat(
             output("\nFin de entrada.")
             break
         except Exception as error:
+            emit_observation(
+                observed,
+                ObservabilityEvent(
+                    "error", "task-error", task_id=task_id,
+                    parent_event_id=root_id,
+                    payload={"status": "error", "error": str(error)},
+                    latency_ms=(perf_counter() - started) * 1000,
+                ),
+            )
             output(f"Error: {error}")
             continue
 
         output("--- Respuesta final ---")
         output(result.response.text)
         output(f"Iteraciones del turno: {result.iterations}")
+        emit_observation(
+            observed,
+            ObservabilityEvent(
+                "result", "task-finished", task_id=task_id,
+                parent_event_id=root_id, model=result.response.model,
+                payload={"status": "completed", "result": result.response.text,
+                         "files_modified": [], "iterations": result.iterations,
+                         "error_count": 0, "sources": []},
+                total_tokens=(llm_client.total_usage.total_tokens
+                              if isinstance(llm_client, ObservedLLMClient)
+                              else result.response.usage.total_tokens),
+                input_tokens=(llm_client.total_usage.input_tokens
+                              if isinstance(llm_client, ObservedLLMClient)
+                              else result.response.usage.input_tokens),
+                output_tokens=(llm_client.total_usage.output_tokens
+                               if isinstance(llm_client, ObservedLLMClient)
+                               else result.response.usage.output_tokens),
+                latency_ms=(perf_counter() - started) * 1000,
+                estimated_cost=None,
+            ),
+        )
 
     return history
 
@@ -226,9 +283,11 @@ def main() -> None:
     try:
         load_environment()
         settings = AgentSettings.from_environment()
-        client = OpenAILLMClient()
+        observability = build_observability_client()
+        client = ObservedLLMClient(OpenAILLMClient(), observability)
         registry = build_default_registry()
-        run_chat(client, registry, settings)
+        run_chat(client, registry, settings, observability=observability)
+        observability.flush()
     except LLMClientError as error:
         print(f"Error de configuración del LLM: {error}")
     except Exception as error:
