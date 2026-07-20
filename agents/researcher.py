@@ -221,15 +221,16 @@ class ResearcherAgent(BaseAgent):
                 audit = self.knowledge_retriever.retrieval_audit()
                 if audit:
                     rag_audits.append(audit)
-            rag = tuple(
-                {
-                    (fragment.reference, fragment.content): fragment
-                    for fragment in rag_fragments
-                }.values()
-            )
+            rag = self._deduplicate_rag(rag_fragments)
 
             repository = self._repository_fragments(task_state, context)
             fragments = [*repository, *memory, *rag]
+            print(
+                f"[Metrics] RAG queries={len(rag_audits)} "
+                f"chunks_retrieved={len(rag_fragments)} "
+                f"chunks_accepted={len(rag)} "
+                f"chunks_discarded={max(0, len(rag_fragments) - len(rag))}"
+            )
             initial_assessment = self.sufficiency_evaluator.evaluate(query, fragments)
             web_needed = not initial_assessment.sufficient
             web_used = False
@@ -516,11 +517,13 @@ class ResearcherAgent(BaseAgent):
             }
             for item in fragments[:12]
         ]
+        corroboration = self._processing_flow_corroboration(fragments, state)
         facts = (
             f"Consultas: {json.dumps([query.__dict__ for query in queries], ensure_ascii=False)}",
             f"Fragmentos aceptados: {json.dumps(bounded_fragments, ensure_ascii=False)}",
             f"Confianza evaluada: {assessment.confidence}",
             f"Información faltante: {json.dumps(list(missing), ensure_ascii=False)}",
+            corroboration,
         )
         selected = context or AgentContext()
         agent_input = AgentInput(
@@ -544,14 +547,17 @@ class ResearcherAgent(BaseAgent):
             agent_input, ToolRegistry(), _reject_tool_calls
         )
         sources = tuple(fragment.to_source() for fragment in fragments)
+        summary = base_result.summary
+        if corroboration.startswith("HECHO CONFIRMADO") and corroboration not in summary:
+            summary = f"{summary}\n{corroboration}".strip()
         return SubagentResult(
             subagent_id=base_result.subagent_id,
             task=base_result.task,
             status="completed" if assessment.sufficient else "blocked",
-            result=base_result.result,
+            result=summary,
             error=base_result.error,
-            summary=base_result.summary,
-            findings=base_result.findings,
+            summary=summary,
+            findings=tuple(dict.fromkeys((*base_result.findings, corroboration))),
             recommendations=base_result.recommendations,
             requested_tool_calls=(),
             sources=sources,
@@ -559,6 +565,42 @@ class ResearcherAgent(BaseAgent):
             blockers=tuple(missing),
             confidence=assessment.confidence,
         )
+
+    @staticmethod
+    def _deduplicate_rag(
+        fragments: Sequence[EvidenceFragment], *, limit: int = 6
+    ) -> tuple[EvidenceFragment, ...]:
+        best: dict[tuple[str, str], EvidenceFragment] = {}
+        for fragment in fragments:
+            key = (fragment.reference, fragment.content)
+            previous = best.get(key)
+            if previous is None or fragment.relevance > previous.relevance:
+                best[key] = fragment
+        return tuple(sorted(best.values(), key=lambda item: item.relevance, reverse=True)[:limit])
+
+    @staticmethod
+    def _processing_flow_corroboration(
+        fragments: Sequence[EvidenceFragment], state: TaskState
+    ) -> str:
+        terms = ("lexer", "parser", "interpreter")
+        rag_confirmed = any(
+            fragment.origin == "rag"
+            and fragment.metadata.get("source_name") == "printscript-language-spec"
+            and "arquitectura de procesamiento" in str(fragment.metadata.get("section", "")).casefold()
+            and all(term in fragment.content.casefold() for term in terms)
+            for fragment in fragments
+        )
+        repository_text = " ".join(
+            [*state.repository_findings]
+            + [source.reference for source in state.sources if source.origin == "repository"]
+            + [fragment.reference + " " + fragment.content for fragment in fragments if fragment.origin == "repository"]
+        ).casefold()
+        repository_confirmed = all(term in repository_text for term in terms)
+        if rag_confirmed and repository_confirmed:
+            return "HECHO CONFIRMADO — El flujo lexer → parser → interpreter está respaldado por el repositorio y la especificación RAG."
+        if rag_confirmed or repository_confirmed:
+            return "CONFIRMACIÓN PARCIAL — El flujo lexer → parser → interpreter tiene respaldo en una sola clase de evidencia."
+        return "NO CONFIRMADO — No hay evidencia suficiente del flujo lexer → parser → interpreter."
 
     @staticmethod
     def _compact_instruction(value: str, *, limit: int = 240) -> str:

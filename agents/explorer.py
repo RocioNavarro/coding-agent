@@ -187,7 +187,32 @@ class ExplorerAgent(BaseAgent):
     def specialization_prompt(self) -> str:
         return (
             "El contexto contiene una exploración acotada generada por detectores. "
-            "No asumas tecnologías ausentes ni haber leído fuentes no inspeccionadas."
+            "No asumas tecnologías ausentes ni haber leído fuentes no inspeccionadas. "
+            "Si la inspección estática produjo evidencia, no marques como blocker una "
+            "mera incertidumbre ni la prohibición de ejecutar comandos; registralas como "
+            "finding o recommendation."
+        )
+
+    def normalize_result(self, result: SubagentResult) -> SubagentResult:
+        """Trata incertidumbres declarativas como tales cuando hubo evidencia válida."""
+        if result.status != "blocked" or not result.summary or not result.sources:
+            return result
+        return SubagentResult(
+            subagent_id=result.subagent_id,
+            task=result.task,
+            status="completed",
+            result=result.result,
+            error=result.error,
+            summary=result.summary,
+            findings=result.findings,
+            recommendations=tuple(dict.fromkeys(
+                (*result.recommendations, *(f"Incertidumbre: {item}" for item in result.blockers))
+            )),
+            requested_tool_calls=result.requested_tool_calls,
+            sources=result.sources,
+            files_relevant=result.files_relevant,
+            blockers=(),
+            confidence=result.confidence,
         )
 
     def run(

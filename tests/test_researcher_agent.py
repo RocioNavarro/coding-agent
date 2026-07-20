@@ -446,3 +446,32 @@ def test_from_settings_respects_disabled_web_search(
     )
 
     assert researcher.web_search is None
+
+
+def test_rag_deduplication_keeps_best_fragment_and_metadata() -> None:
+    weaker = EvidenceFragment(
+        "rag", "spec", "lexer parser interpreter", 0.6,
+        {"source_name": "printscript-language-spec", "section": "Arquitectura de procesamiento"},
+    )
+    stronger = EvidenceFragment(
+        "rag", "spec", "lexer parser interpreter", 0.9,
+        {"source_name": "printscript-language-spec", "section": "Arquitectura de procesamiento", "query": "flow"},
+    )
+
+    result = ResearcherAgent._deduplicate_rag((weaker, stronger))
+
+    assert result == (stronger,)
+    assert result[0].metadata["query"] == "flow"
+
+
+def test_processing_flow_is_confirmed_with_repository_and_rag() -> None:
+    state = TaskState.create("Analizar flujo")
+    state.add_repository_finding("entry_points=lexer, parser, interpreter")
+    fragment = EvidenceFragment(
+        "rag", "spec", "El lexer entrega tokens al parser y luego al interpreter.", 0.9,
+        {"source_name": "printscript-language-spec", "section": "Arquitectura de procesamiento"},
+    )
+
+    finding = ResearcherAgent._processing_flow_corroboration((fragment,), state)
+
+    assert finding.startswith("HECHO CONFIRMADO")

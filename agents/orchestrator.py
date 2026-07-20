@@ -322,6 +322,39 @@ class LLMPlanGenerator:
         return "unknown"
 
 
+class DeterministicAnalysisPlanGenerator:
+    """Construye el plan predecible de análisis sin otra llamada al LLM."""
+
+    MAX_REFERENCES = 8
+
+    def generate(
+        self, state: TaskState, *, feedback: Sequence[str] = ()
+    ) -> str:
+        references = list(dict.fromkeys(
+            [path for result in state.subagent_results for path in result.files_relevant]
+            + [source.reference for source in state.sources]
+        ))[: self.MAX_REFERENCES]
+        uncertainties = list(dict.fromkeys(
+            [*state.warnings, *(error.message for error in state.errors)]
+        ))[:4]
+        lines = [
+            "1. Revisar la estructura y los módulos detectados.",
+            "2. Consolidar la evidencia del repositorio y del RAG.",
+            "3. Identificar arquitectura, dependencias y puntos de entrada.",
+            "4. Identificar comandos documentados, sin ejecutarlos.",
+            "5. Identificar riesgos e incertidumbres.",
+            "6. Generar el informe técnico final separando hechos, inferencias y datos no confirmados.",
+            "Restricción: trabajar exclusivamente en modo de lectura, sin ejecutar comandos ni usar web.",
+        ]
+        if references:
+            lines.append("Referencias priorizadas: " + ", ".join(references))
+        if uncertainties:
+            lines.append("Incertidumbres: " + "; ".join(uncertainties))
+        if feedback:
+            lines.append("Ajustes solicitados: " + "; ".join(feedback))
+        return "\n".join(lines)
+
+
 @dataclass(frozen=True)
 class OrchestrationResult:
     status: OrchestrationStatus
@@ -362,6 +395,7 @@ class MainAgent:
             raise ValueError("minimum_evidence_confidence debe estar entre 0 y 1.")
         self.task_analyzer = task_analyzer
         self.plan_generator = plan_generator
+        self.analysis_plan_generator = DeterministicAnalysisPlanGenerator()
         self.explorer = explorer
         self.researcher = researcher
         self.implementer = implementer
@@ -424,7 +458,9 @@ class MainAgent:
                     )
             state.set_status("running")
             state.set_phase("analysis")
+            started = perf_counter()
             analysis = self.task_analyzer.analyze(request)
+            print(f"[Metrics] Analyzer duration={perf_counter() - started:.2f}s")
             state.add_observation(
                 f"Tarea clasificada como {analysis.kind}: {analysis.rationale}"
             )
@@ -435,9 +471,16 @@ class MainAgent:
                 task_id=state.task_id,
                 parent_event_id=f"{state.task_id}:explorer:0", agent="explorer",
             ):
-                self.explorer.run(request, state, profile_context)
+                started = perf_counter()
+                exploration = self.explorer.run(request, state, profile_context)
+                print(f"[Metrics] Explorer duration={perf_counter() - started:.2f}s")
             selected.append("explorer")
             self._record_agent(state, "explorer", 0)
+            if exploration.status != "completed":
+                return self._blocked(
+                    state, selected, 0,
+                    f"Explorer detuvo el flujo con estado {exploration.status}.",
+                )
 
             needs_research = analysis.research_required or analysis.kind == "change"
             if needs_research:
@@ -448,12 +491,19 @@ class MainAgent:
                     task_id=state.task_id,
                     parent_event_id=f"{state.task_id}:researcher:0", agent="researcher",
                 ):
+                    started = perf_counter()
                     research = self.researcher.run(request, state, profile_context)
+                    print(f"[Metrics] Researcher duration={perf_counter() - started:.2f}s")
                 selected.append("researcher")
                 self._record_agent(state, "researcher", 0)
+                if research.subagent_result.status != "completed":
+                    return self._blocked(
+                        state, selected, 0,
+                        "La evidencia técnica es insuficiente: Researcher detuvo "
+                        f"el flujo con estado {research.subagent_result.status}.",
+                    )
                 if (
-                    research.subagent_result.status != "completed"
-                    or research.confidence < self.minimum_evidence_confidence
+                    research.confidence < self.minimum_evidence_confidence
                     or not research.sources_recovered
                 ):
                     return self._blocked(
@@ -463,7 +513,20 @@ class MainAgent:
             feedback: tuple[str, ...] = ()
             for iteration in range(1, self.max_iterations + 1):
                 state.set_phase("planning")
-                plan = self.plan_generator.generate(state, feedback=feedback)
+                started = perf_counter()
+                planner = (
+                    self.analysis_plan_generator
+                    if analysis.kind == "analysis"
+                    else self.plan_generator
+                )
+                plan = planner.generate(state, feedback=feedback)
+                chars = len(plan)
+                print(
+                    f"[Metrics] PlanGenerator context_chars={chars} "
+                    f"approx_tokens={(chars + 3) // 4} "
+                    f"duration={perf_counter() - started:.2f}s "
+                    f"mode={'deterministic' if analysis.kind == 'analysis' else 'llm'}"
+                )
                 state.propose_plan(plan)
                 decision: PlanReview = review_plan(plan)
                 if decision.action == "reject":

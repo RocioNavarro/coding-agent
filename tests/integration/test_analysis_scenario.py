@@ -41,7 +41,10 @@ def test_analysis_only_runs_explorer_plan_and_optional_reviewer(
     assert result.status == "completed"
     assert result.selected_agents == ("explorer", "reviewer")
     assert state.task_id == "analysis-scenario"
-    assert state.approved_plan == "1. Inspect structure\n2. Report evidence"
+    assert state.approved_plan is not None
+    assert "Revisar la estructura" in state.approved_plan
+    assert "Generar el informe técnico final" in state.approved_plan
+    assert "modo de lectura" in state.approved_plan
     assert any("Estrategia de exploración: full" in item for item in state.observations)
     assert reviewer.calls == ["Revisar el resultado del análisis"]
     assert implementer.calls == tester.calls == 0

@@ -3,7 +3,9 @@
 from dataclasses import dataclass
 from types import SimpleNamespace
 
-from agents.orchestrator import MainAgent, TaskAnalysis
+from agents.orchestrator import (
+    DeterministicAnalysisPlanGenerator, MainAgent, TaskAnalysis,
+)
 from agents.project_memory import ProjectMemory
 from core.models import EvidenceAssessment, PlanReview
 from core.task_state import SourceReference, SubagentResult, TaskState
@@ -57,6 +59,16 @@ class FakeExplorer:
         result = SubagentResult(
             "explorer", instruction, "completed", summary="Repositorio explorado.",
             files_relevant=("src/app.txt",), confidence=0.9,
+        )
+        state.add_subagent_result(result)
+        return result
+
+
+class BlockedExplorer(FakeExplorer):
+    def run(self, instruction: str, state: TaskState, *args, **kwargs) -> SubagentResult:
+        result = SubagentResult(
+            "explorer", instruction, "blocked", summary="Parcial.",
+            blockers=("Sin acceso a evidencia.",), files_relevant=("settings.gradle.kts",),
         )
         state.add_subagent_result(result)
         return result
@@ -541,6 +553,36 @@ def test_stops_when_research_evidence_is_insufficient() -> None:
     assert planner.feedback == []
     assert implementer.calls == tester.calls == reviewer.calls == 0
     assert "evidencia técnica es insuficiente" in result.final_response
+
+
+def test_analysis_plan_is_deterministic_and_read_only() -> None:
+    state = TaskState.create("Analizar arquitectura")
+    state.add_subagent_result(SubagentResult(
+        "explorer", "analizar", "completed", summary="Módulos confirmados",
+        files_relevant=("settings.gradle.kts",),
+    ))
+    plan = DeterministicAnalysisPlanGenerator().generate(state)
+
+    assert "Generar el informe técnico final" in plan
+    assert "settings.gradle.kts" in plan
+    assert "modo de lectura" in plan
+    assert not any(word in plan for word in ("Implementer", "Tester", "Reviewer"))
+
+
+def test_blocked_explorer_stops_before_research_and_planning() -> None:
+    researcher = FakeResearcher()
+    agent, planner, implementer, tester, reviewer = build_agent(
+        kind="analysis", researcher=researcher
+    )
+    agent.explorer = BlockedExplorer()
+
+    result = agent.run("Analizar arquitectura", approve)
+
+    assert result.status == "blocked"
+    assert researcher.calls == 0
+    assert planner.feedback == []
+    assert implementer.calls == tester.calls == reviewer.calls == 0
+    assert result.task_state.subagent_results[0].summary == "Parcial."
 
 
 def test_partial_evidence_reexplores_and_never_reaches_implementation() -> None:

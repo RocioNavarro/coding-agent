@@ -171,10 +171,15 @@ class BaseAgent(ABC):
                 agent_input, tools,
                 lambda response: self.validate_tool_calls(response.tool_calls, tools),
             )
+        result = self.normalize_result(result)
 
         task_state.add_subagent_result(result)
         for source in result.sources:
             task_state.add_source(source)
+        return result
+
+    def normalize_result(self, result: SubagentResult) -> SubagentResult:
+        """Permite normalización semántica específica antes de persistir el resultado."""
         return result
 
     def _complete_and_parse(
