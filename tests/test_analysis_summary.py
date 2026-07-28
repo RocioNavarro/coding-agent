@@ -144,6 +144,6 @@ def test_explorer_persists_gradle_evidence_without_running_commands() -> None:
     assert dependencies == {"cli": ("lexer",)}
     assert versions == {"cli": "1.0", "lexer": "2.0"}
     assert {"./gradlew spotlessApply", "./gradlew build", "./gradlew check"} <= set(commands)
-    assert any(item.startswith("root_writes_hooks=") for item in risks)
-    assert {"Kotlin", "Java toolchain", "Gradle", "Picocli", "Gson", "JUnit",
-            "Kotlin Test", "Spotless", "Foojay"} <= set(technologies)
+    assert any("instala hooks" in item for item in risks)
+    assert "Gradle" in technologies
+    assert any(item.startswith("Java toolchain 21") for item in technologies)

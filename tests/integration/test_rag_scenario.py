@@ -48,7 +48,9 @@ def test_rag_evidence_avoids_web_and_remains_traceable(rag_repository) -> None:
     assert len(rag.calls) == 1
     assert web.calls == []
     assert any(source.origin == "rag" for source in state.sources)
-    assert "[utilizado:rag] docs/contract.md#contract" in result.final_response
+    assert "docs/contract.md#contract" in result.final_response
+    assert "recuperados=1; utilizados=1; descartados=0; documentos=1" in result.final_response
+    assert '"retrieved"' not in result.final_response
     trace_text = next(
         item.removeprefix("RAG trace: ")
         for item in state.observations if item.startswith("RAG trace: ")

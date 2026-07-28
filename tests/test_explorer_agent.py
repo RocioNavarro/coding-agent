@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from agents.base import AgentExecutionError
+from agents.analysis_summary import DeterministicAnalysisSummary
 from agents.explorer import EXPLORER_ALLOWED_TOOLS, ExplorerAgent
 from agents.project_memory import ProjectMemory
 from agents.repository_detection import (
@@ -17,7 +18,7 @@ from agents.repository_detection import (
     RepositorySnapshot,
 )
 from core.models import LLMResponse, LLMUsage, Message, ToolCall
-from core.task_state import TaskState
+from core.task_state import SourceReference, SubagentResult, TaskState
 from tools.definitions import ToolDefinition
 from tools.registry import ToolRegistry
 
@@ -226,6 +227,135 @@ def test_gradle_settings_are_authoritative_for_modules(tmp_path: Path) -> None:
     assert report.module_warnings == (
         "El módulo 'runner' aparece repetido en settings.gradle.kts.",
     )
+
+
+def test_incremental_scan_reloads_real_gradle_and_functional_evidence(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "printscript-like"
+    storage = tmp_path / "memory"
+    write(root / "settings.gradle.kts", '''
+        pluginManagement { plugins { kotlin("jvm") version "2.1.10" } }
+        plugins { id("org.gradle.toolchains.foojay-resolver-convention") version "0.8.0" }
+        include(
+            "linter", "cli", "formatter", "interpreter", "lexer", "parser",
+            "token", "common", "runner"
+        )
+        include("runner")
+    ''')
+    write(root / "build.gradle.kts", '''
+        tasks.register("installGitHooks") {
+            file("gradle/scripts/pre-commit").writeText("./gradlew spotlessApply\\n./gradlew test")
+            Files.copy(source, file(".git/hooks/pre-commit"))
+        }
+    ''')
+    write(root / "buildSrc/build.gradle.kts", '''
+        dependencies {
+            implementation("org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.10")
+            implementation("com.diffplug.spotless:spotless-plugin-gradle:6.25.0")
+        }
+        java { toolchain { languageVersion.set(JavaLanguageVersion.of(21)) } }
+    ''')
+    write(root / "buildSrc/src/main/kotlin/org.printscript.conventions.gradle.kts", '''
+        tasks.named("check") { dependsOn("spotlessCheck", "jacocoTestReport") }
+    ''')
+    dependencies = {
+        "cli": ("lexer", "parser", "interpreter", "formatter", "linter", "common", "token"),
+        "runner": ("common", "token", "lexer", "parser", "interpreter"),
+        "interpreter": ("parser", "common", "token", "lexer"),
+        "parser": ("token", "common"), "linter": ("parser", "common", "lexer", "token"),
+        "formatter": ("parser", "common", "token"), "lexer": ("token",),
+    }
+    versions = {"cli": "1.5-SNAPSHOT", "formatter": "3.2-SNAPSHOT"}
+    for module in ("linter", "cli", "formatter", "interpreter", "lexer", "parser", "token", "common", "runner"):
+        deps = "\n".join(f"implementation project(':{item}')" for item in dependencies.get(module, ()))
+        external = {
+            "cli": "implementation 'info.picocli:picocli:4.7.6'\ntestImplementation 'org.junit.jupiter:junit-jupiter:5.10.3'",
+            "formatter": "implementation 'com.google.code.gson:gson:2.11.0'",
+            "linter": "implementation 'com.google.code.gson:gson:2.11.0'",
+        }.get(module, "")
+        test_block = 'test { minHeapSize = "64m"\nmaxHeapSize = "128m"\n}' if module in {"runner", "interpreter"} else ""
+        write(root / module / "build.gradle", f"version = '{versions.get(module, '1.0-SNAPSHOT')}'\n{deps}\n{external}\ntestImplementation 'org.jetbrains.kotlin:kotlin-test'\n{test_block}")
+    functional = {
+        "common/src/main/kotlin/org/printscript/common/Position.kt": "class Position",
+        "token/src/main/kotlin/token/Token.kt": "class Token",
+        "lexer/src/main/kotlin/org/printscript/lexer/Lexer.kt": "class Lexer",
+        "parser/src/main/kotlin/org/printscript/parser/DefaultParser.kt": "class DefaultParser",
+        "interpreter/src/main/kotlin/org/printscript/interpreter/Interpreter.kt": "class Interpreter",
+        "formatter/src/main/kotlin/org/printscript/formatter/CodeFormatter.kt": "class CodeFormatter",
+        "linter/src/main/kotlin/org/printscript/linter/Linter.kt": "class Linter",
+        "runner/src/main/kotlin/org/printscript/runner/Runner.kt": "InputStream Lexer Parser Interpreter",
+        "cli/src/main/kotlin/org/printscript/cli/Main.kt": "fun main()",
+        "cli/src/main/kotlin/org/printscript/cli/commands/ExecuteCmd.kt": "FrontendAdapter InterpreterAdapter",
+        "cli/src/main/kotlin/org/printscript/cli/commands/AnalyzeCmd.kt": "class AnalyzeCmd",
+        "cli/src/main/kotlin/org/printscript/cli/adapters/FrontendAdapter.kt": "Lexer DefaultParser",
+        "cli/src/main/kotlin/org/printscript/cli/adapters/InterpreterAdapter.kt": "Interpreter",
+    }
+    for path, content in functional.items():
+        write(root / path, content)
+    write(root / "README.md", "./gradlew build\n./gradlew test\n./gradlew check")
+    write(root / ".github/workflows/ci.yml", "./gradlew spotlessCheck\n./gradlew jacocoTestReport\n./gradlew publish")
+
+    first_memory = ProjectMemory(root, storage_root=storage)
+    ExplorerAgent(repository_root=root, llm_client=FakeExplorerLLM(), project_memory=first_memory).run(
+        "Analizar arquitectura", TaskState.create("primera")
+    )
+    state = TaskState.create("segunda incremental")
+    report = ExplorerAgent(
+        repository_root=root, llm_client=FakeExplorerLLM(),
+        project_memory=ProjectMemory(root, storage_root=storage),
+    ).run("Analizar arquitectura", state)
+
+    assert dependencies.items() <= report_result_dependencies(state).items()
+    assert any("Kotlin Gradle Plugin 2.1.10" in item for item in state.repository_findings)
+    assert any("Java toolchain 21" in item for item in state.repository_findings)
+    assert any("Spotless 6.25.0" in item for item in state.repository_findings)
+    assert any("Picocli 4.7.6" in item for item in state.repository_findings)
+    assert any("Gson 2.11.0" in item for item in state.repository_findings)
+    assert any("JUnit Jupiter 5.10.3" in item for item in state.repository_findings)
+    assert any("Foojay Resolver Convention 0.8.0" in item for item in state.repository_findings)
+    commands = "\n".join(state.observations)
+    for command in ("build", "test", "check", "spotlessCheck", "spotlessApply", "jacocoTestReport", "publish"):
+        assert f"./gradlew {command}" in commands
+    assert sum(item.startswith("risk=") for item in state.repository_findings) == 6
+    assert any(
+        source.reference == "runner/src/main/kotlin/org/printscript/runner/Runner.kt"
+        for source in state.sources
+    )
+    assert state.commands_executed == ()
+    rag_source = SourceReference("rag", "docs/printscript-language-spec.md")
+    state.add_source(rag_source)
+    state.add_subagent_result(SubagentResult(
+        "researcher", "analizar", "completed",
+        summary="HECHO CONFIRMADO: lexer, parser e interpreter forman el pipeline.",
+        findings=("HECHO CONFIRMADO: flujo corroborado.",), sources=(rag_source,),
+    ))
+    summary = DeterministicAnalysisSummary().build(state)
+    for module, module_dependencies in dependencies.items():
+        assert f"{module} → {', '.join(module_dependencies)}" in summary
+    for technology in (
+        "Kotlin Gradle Plugin 2.1.10", "Java toolchain 21", "Spotless 6.25.0",
+        "Picocli 4.7.6", "Gson 2.11.0", "JUnit Jupiter 5.10.3",
+        "kotlin-test", "Foojay Resolver Convention 0.8.0",
+    ):
+        assert technology in summary
+    for command in ("build", "test", "check", "spotlessCheck", "spotlessApply", "jacocoTestReport", "publish"):
+        assert f"./gradlew {command}" in summary
+    assert summary.count("Inferencia:") >= 6
+    assert "Módulos declarados más de una vez: runner" in summary
+    assert "Camino alternativo: `runner` conecta Lexer → Parser → Interpreter" in summary
+    assert "Evidencia: `runner/src/main/kotlin/org/printscript/runner/Runner.kt`" in summary
+
+
+def report_result_dependencies(state: TaskState) -> dict[str, tuple[str, ...]]:
+    result = {}
+    for finding in state.repository_findings:
+        if not finding.startswith("internal_dependency="):
+            continue
+        relation = finding.removeprefix("internal_dependency=").split(";", 1)[0]
+        module, dependencies = relation.split("->", 1)
+        result[module.strip()] = tuple(item.strip() for item in dependencies.split(","))
+    return result
 
 
 def registry_with_write() -> ToolRegistry:

@@ -102,10 +102,13 @@ class ResultPresenter(Protocol):
 class TextResultPresenter:
     """Presentación textual de resultados, checks, archivos y fuentes."""
 
+    MAX_SOURCES = 16
+    MAX_AGENT_SUMMARY_CHARS = 320
+
     def present(self, state: TaskState) -> str:
         agents = "\n".join(
             f"- {result.subagent_id}: {result.status} — "
-            f"{result.summary or result.result or 'sin resumen'}"
+            f"{self._bounded(result.summary or result.result or 'sin resumen')}"
             for result in state.subagent_results
         ) or "- Ninguno."
         files = "\n".join(f"- {path}" for path in state.files_modified) or "- Ninguno."
@@ -115,18 +118,27 @@ class TextResultPresenter:
             for call in state.tool_calls
             if call.tool_name == "validation_command"
         ) or "- No se ejecutaron checks."
+        visible_sources = []
+        seen_references = set()
+        for source in state.sources:
+            if source.reference in seen_references or source.reference in (state.final_result or ""):
+                continue
+            seen_references.add(source.reference)
+            visible_sources.append(source)
+            if len(visible_sources) >= self.MAX_SOURCES:
+                break
         sources = "\n".join(
             f"- [{'inferido' if source.origin == 'inference' else 'utilizado'}:"
             f"{source.origin}] {source.reference}"
-            for source in state.sources
-        ) or "- Sin fuentes adicionales."
+            for source in visible_sources
+        ) or "- Ya incluidas en el informe."
         rag_traces = "\n".join(
-            f"- {observation.removeprefix('RAG trace: ')}"
+            f"- {self._rag_summary(observation.removeprefix('RAG trace: '))}"
             for observation in state.observations
             if observation.startswith("RAG trace: ")
         ) or "- Sin recuperación RAG registrada."
         web_traces = "\n".join(
-            f"- {observation.removeprefix('WEB trace: ')}"
+            f"- {self._web_summary(observation.removeprefix('WEB trace: '))}"
             for observation in state.observations
             if observation.startswith("WEB trace: ")
         ) or "- Sin fallback web registrado."
@@ -135,6 +147,40 @@ class TextResultPresenter:
             f"Archivos modificados:\n{files}\n\nValidaciones:\n{checks}\n\n"
             f"Fuentes:\n{sources}\n\nTrazabilidad RAG (recuperado/utilizado):\n"
             f"{rag_traces}\n\nTrazabilidad web (encontrado/utilizado):\n{web_traces}"
+        )
+
+    @classmethod
+    def _bounded(cls, value: str) -> str:
+        compact = " ".join(value.split())
+        if len(compact) <= cls.MAX_AGENT_SUMMARY_CHARS:
+            return compact
+        return compact[: cls.MAX_AGENT_SUMMARY_CHARS - 1].rstrip() + "…"
+
+    @staticmethod
+    def _rag_summary(payload_text: str) -> str:
+        try:
+            payload = json.loads(payload_text)
+        except (TypeError, json.JSONDecodeError):
+            return "traza inválida"
+        return (
+            f"query={payload.get('query', '')!r}; "
+            f"recuperados={len(payload.get('retrieved', []))}; "
+            f"utilizados={len(payload.get('used', []))}; "
+            f"descartados={len(payload.get('discarded', []))}; "
+            f"documentos={len(payload.get('documents', []))}"
+        )
+
+    @staticmethod
+    def _web_summary(payload_text: str) -> str:
+        try:
+            payload = json.loads(payload_text)
+        except (TypeError, json.JSONDecodeError):
+            return "traza inválida"
+        return (
+            f"query={payload.get('query', '')!r}; "
+            f"consultas={len(payload.get('executed_queries', []))}; "
+            f"encontrados={len(payload.get('found', []))}; "
+            f"utilizados={len(payload.get('used', []))}"
         )
 
 

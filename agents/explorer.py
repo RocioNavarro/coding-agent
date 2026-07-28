@@ -108,6 +108,7 @@ class ExplorerReport:
     documented_gradle_commands: tuple[str, ...] = ()
     gradle_risks: tuple[str, ...] = ()
     gradle_technologies: tuple[str, ...] = ()
+    functional_files: tuple[str, ...] = ()
 
     def facts(self) -> tuple[str, ...]:
         facts = [f"Resumen de arquitectura: {self.architecture_summary}"]
@@ -255,6 +256,7 @@ class ExplorerAgent(BaseAgent):
         modules, build_infrastructure, module_warnings = self._gradle_modules(
             inventory, contents
         )
+        functional_files = self._functional_evidence_files(inventory.files)
         internal_dependencies, module_versions, gradle_commands, gradle_risks, gradle_technologies = (
             self._gradle_evidence(contents)
         )
@@ -270,7 +272,10 @@ class ExplorerAgent(BaseAgent):
         )
         commands = tuple(sorted({command for item in detections for command in item.commands}))
         conventions = self._detect_conventions(inventory)
-        relevant = self._select_relevant_files(instruction, inventory, detections)
+        relevant = tuple(dict.fromkeys((
+            *functional_files,
+            *self._select_relevant_files(instruction, inventory, detections),
+        )))
         summary = self._summarize(inventory, detections)
         return ExplorerReport(
             inventory=inventory,
@@ -288,6 +293,7 @@ class ExplorerAgent(BaseAgent):
             documented_gradle_commands=gradle_commands,
             gradle_risks=gradle_risks,
             gradle_technologies=gradle_technologies,
+            functional_files=functional_files,
         )
 
     def _scan(self) -> tuple[RepositoryInventory, dict[str, str], dict[str, object]]:
@@ -342,13 +348,32 @@ class ExplorerAgent(BaseAgent):
             if path in previous and path not in modified_files
         )
         revalidated = stable_selected[:1] if memory_valid else ()
-        selected_to_read = (
+        incremental_selected = (
             selected if not memory_valid else
             tuple(dict.fromkeys((
                 *(path for path in selected if path in new_files or path in modified_files),
                 *revalidated,
             )))
         )
+        gradle_repository = any(
+            Path(path).name in {
+                "settings.gradle", "settings.gradle.kts", "build.gradle", "build.gradle.kts"
+            }
+            for path in configuration
+        )
+        deterministic_evidence = (
+            tuple(dict.fromkeys((
+                *configuration,
+                *scripts,
+                *ci_files,
+                *(path for path in documentation if Path(path).stem.casefold() == "readme"),
+                *self._functional_evidence_files(files),
+            )))
+            if gradle_repository else ()
+        )
+        selected_to_read = tuple(dict.fromkeys((
+            *deterministic_evidence, *incremental_selected,
+        )))
         contents = self._read_selected(selected_to_read)
         avoided = tuple(path for path in stable_selected if path not in revalidated)
         strategy = "incremental" if memory_valid else "full"
@@ -420,6 +445,24 @@ class ExplorerAgent(BaseAgent):
             except (OSError, UnicodeError):
                 continue
         return contents
+
+    @staticmethod
+    def _functional_evidence_files(files: Sequence[str]) -> tuple[str, ...]:
+        """Selecciona implementaciones representativas para responsabilidades y flujo."""
+        priorities = (
+            "/common/Position.kt", "/token/Token.kt", "/lexer/Lexer.kt",
+            "/parser/DefaultParser.kt", "/interpreter/Interpreter.kt",
+            "/formatter/CodeFormatter.kt", "/linter/Linter.kt", "/runner/Runner.kt",
+            "/cli/Main.kt", "/commands/ExecuteCmd.kt", "/commands/AnalyzeCmd.kt",
+            "/adapters/FrontendAdapter.kt", "/adapters/InterpreterAdapter.kt",
+        )
+        normalized = tuple((f"/{path}", path) for path in files)
+        return tuple(
+            path
+            for suffix in priorities
+            for candidate, path in normalized
+            if candidate.endswith(suffix)
+        )
 
     @staticmethod
     def _detect_conventions(
@@ -591,13 +634,18 @@ class ExplorerAgent(BaseAgent):
             )
         for risk in report.gradle_risks:
             state.add_repository_finding(risk)
-        for technology in report.gradle_technologies:
+        if report.gradle_technologies:
             state.add_repository_finding(
-                f"gradle_technology={technology}; evidencia: configuración Gradle."
+                "gradle_technology=" + ", ".join(report.gradle_technologies)
+                + "; evidencia: configuración Gradle."
             )
         for command in report.documented_gradle_commands:
             state.add_observation(
                 f"Comando detectado: {command}; evidencia: archivos Gradle, scripts o CI."
+            )
+        for path in report.functional_files:
+            state.add_source(
+                SourceReference("repository", path, "implementación funcional representativa")
             )
         artifact_groups = (
             ("configuración", report.inventory.configuration_files),
@@ -661,25 +709,71 @@ class ExplorerAgent(BaseAgent):
         repeated = [names for names in duplicates.values() if len(names) > 1]
         if repeated:
             risks.append(
-                "duplicated_test_configuration="
-                + ", ".join("/".join(names) for names in repeated)
-                + "; evidencia: build.gradle de esos módulos."
+                "risk=maintenance|Configuración de tests duplicada|"
+                + ", ".join(f"{name}/build.gradle" for names in repeated for name in names)
+                + "|Inferencia: aumenta el costo de cambios de configuración."
             )
         root_build = contents.get("build.gradle.kts", "") or contents.get("build.gradle", "")
         if "installGitHooks" in root_build and any(
             token in root_build for token in ("writeText", "Files.copy", ".git/hooks")
         ):
-            risks.append("root_writes_hooks=installGitHooks; evidencia: build.gradle.kts.")
+            risks.append(
+                "risk=side_effects|La tarea raíz instala hooks o scripts|build.gradle.kts|"
+                "Inferencia: ejecutar esa tarea produce efectos fuera del build declarativo."
+            )
+        settings = contents.get("settings.gradle.kts", "") or contents.get("settings.gradle", "")
+        includes = [
+            name.lstrip(":")
+            for block in re.findall(r"\binclude\s*\((.*?)\)", settings, re.DOTALL)
+            for name in re.findall(r"['\"]([^'\"]+)['\"]", block)
+        ]
+        repeated_modules = tuple(
+            name for name in dict.fromkeys(includes) if includes.count(name) > 1
+        )
+        if repeated_modules:
+            risks.append(
+                "risk=gradle_structure|Módulos declarados más de una vez: "
+                + ", ".join(repeated_modules)
+                + "|settings.gradle.kts|Inferencia: puede confundir el mantenimiento de la configuración."
+            )
+        if len(set(versions.values())) > 1:
+            risks.append(
+                "risk=versioning|Versiones de módulos desalineadas|*/build.gradle|"
+                "Inferencia: puede dificultar releases coordinados."
+            )
+        cli_dependencies = dependencies.get("cli", ())
+        if len(cli_dependencies) >= 5:
+            risks.append(
+                "risk=coupling|El CLI depende de numerosos módulos internos|cli/build.gradle|"
+                "Inferencia: cambios internos pueden propagarse a la capa CLI."
+            )
+        if (
+            any(path.endswith("/runner/Runner.kt") for path in (f"/{item}" for item in contents))
+            and any(path.endswith("/commands/ExecuteCmd.kt") for path in (f"/{item}" for item in contents))
+        ):
+            risks.append(
+                "risk=architecture|Existen dos caminos de ejecución: CLI/adapters y runner|"
+                "cli/src/main/kotlin/org/printscript/cli/commands/ExecuteCmd.kt, "
+                "runner/src/main/kotlin/org/printscript/runner/Runner.kt|"
+                "Inferencia: ambos caminos pueden divergir si evolucionan por separado."
+            )
         all_content = "\n".join(contents.values()).casefold()
         technologies = ["Gradle"]
-        for token, label in (
-            ("kotlin", "Kotlin"), ("javalanguageversion", "Java toolchain"),
-            ("picocli", "Picocli"), ("gson", "Gson"), ("junit", "JUnit"),
-            ("kotlin-test", "Kotlin Test"), ("spotless", "Spotless"),
-            ("foojay", "Foojay"),
-        ):
-            if token in all_content:
-                technologies.append(label)
+        patterns = (
+            (r"kotlin(?:\(\"jvm\"\)|-gradle-plugin)\D{0,30}(\d+\.\d+\.\d+)", "Kotlin Gradle Plugin"),
+            (r"javalanguageversion\.of\((\d+)\)", "Java toolchain"),
+            (r"spotless(?:-plugin-gradle)?[:'\"\s]+(?:spotless-plugin-gradle:)?(\d+\.\d+\.\d+)", "Spotless"),
+            (r"picocli:picocli:(\d+\.\d+\.\d+)", "Picocli"),
+            (r"gson:gson:(\d+\.\d+\.\d+)", "Gson"),
+            (r"junit-jupiter:(\d+\.\d+\.\d+)", "JUnit Jupiter"),
+            (r"foojay-resolver-convention[^\n]*?version\s+[\"'](\d+\.\d+\.\d+)", "Foojay Resolver Convention"),
+        )
+        for pattern, label in patterns:
+            match = re.search(pattern, all_content)
+            if match:
+                technologies.append(f"{label} {match.group(1)}")
+        if "kotlin-test" in all_content:
+            technologies.append("kotlin-test")
         return (
             dependencies, versions, tuple(dict.fromkeys(commands)), tuple(risks),
             tuple(technologies),

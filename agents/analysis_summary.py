@@ -58,7 +58,9 @@ class DeterministicAnalysisSummary:
             if module not in modules:
                 continue
             marker, description = self.RESPONSIBILITIES[module]
-            proof = next((path for path in paths if marker in path), None)
+            candidates = [path for path in paths if marker in path]
+            proof = next((path for path in candidates if path.endswith(".kt")), None)
+            proof = proof or next(iter(candidates), None)
             responsibilities.append(
                 f"- **{module}**: {description}. Evidencia: `{proof}`."
                 if proof else f"- **{module}**: responsabilidad no confirmada con la evidencia disponible."
@@ -155,17 +157,12 @@ class DeterministicAnalysisSummary:
 
     @classmethod
     def _technologies(cls, findings: Sequence[str]) -> tuple[str, ...]:
-        aliases = (
-            ("kotlin", "Kotlin"), ("java toolchain", "Java toolchain"),
-            ("gradle", "Gradle"), ("picocli", "Picocli"), ("gson", "Gson"),
-            ("junit", "JUnit"), ("kotlin test", "Kotlin Test"),
-            ("spotless", "Spotless"), ("foojay", "Foojay"),
-        )
+        structured = cls._values(findings, "gradle_technology=")
+        if structured:
+            return structured
+        aliases = (("kotlin", "Kotlin"), ("gradle", "Gradle"))
         text = "\n".join(findings).casefold()
-        return tuple(
-            label for token, label in aliases
-            if token in text or token.replace(" ", "-") in text
-        )
+        return tuple(label for token, label in aliases if token in text)
 
     @classmethod
     def _entry_points(cls, findings: Sequence[str]) -> tuple[str, ...]:
@@ -237,7 +234,10 @@ class DeterministicAnalysisSummary:
             lines.append("- `buildSrc`: infraestructura de build; no es un módulo declarado.")
         if modules:
             lines.append("- Subproyectos: " + ", ".join(modules) + ".")
-        if "runner" in evidence.casefold() and "duplic" in evidence.casefold():
+        lowered = evidence.casefold()
+        if "runner" in lowered and any(
+            term in lowered for term in ("duplic", "repetid", "más de una vez", "múltiples declaraciones")
+        ):
             lines.append("- `runner` aparece declarado más de una vez en settings.")
         return "\n".join(lines)
 
@@ -247,7 +247,17 @@ class DeterministicAnalysisSummary:
     ) -> tuple[tuple[str, str, str], ...]:
         low = evidence.casefold()
         risks = []
-        if "runner" in low and "duplic" in low:
+        for line in evidence.splitlines():
+            if not line.startswith("risk="):
+                continue
+            parts = line.removeprefix("risk=").split("|", 3)
+            if len(parts) == 4:
+                _category, description, source, impact = parts
+                risks.append((description, source, impact))
+        duplicate_terms = ("duplic", "repetid", "más de una vez", "múltiples declaraciones")
+        if not any("runner" in item[0].casefold() for item in risks) and (
+            "runner" in low and any(term in low for term in duplicate_terms)
+        ):
             risks.append(("Declaración duplicada de runner", "settings.gradle.kts", "Inferencia: puede confundir el mantenimiento de la configuración."))
         version_finding = next(
             (line for line in evidence.splitlines() if line.startswith("module_versions=")),
@@ -258,16 +268,18 @@ class DeterministicAnalysisSummary:
             for item in version_finding.split("=", 1)[-1].split(";", 1)[0].split(",")
             if ":" in item
         }
-        if len(versions) > 1:
+        if len(versions) > 1 and not any("versiones" in item[0].casefold() for item in risks):
             risks.append(("Versiones de módulos desalineadas", "archivos build.gradle de los módulos", "Inferencia: puede dificultar releases coordinados."))
-        if "duplicated_test_configuration=" in low:
+        if "duplicated_test_configuration=" in low and not any("tests" in item[0].casefold() for item in risks):
             risks.append(("Configuración de tests duplicada", "build.gradle de los módulos indicados", "Inferencia: aumenta el costo de cambios de configuración."))
-        if "root_writes_hooks=" in low:
+        if "root_writes_hooks=" in low and not any("hooks" in item[0].casefold() for item in risks):
             risks.append(("La tarea raíz instala hooks o scripts", "build.gradle.kts", "Inferencia: ejecutar esa tarea produce efectos fuera del build declarativo."))
-        if any("runner/" in path and path.endswith("Runner.kt") for path in paths) and any("ExecuteCmd.kt" in path for path in paths):
+        if (not any("caminos de ejecución" in item[0].casefold() for item in risks)
+                and any("runner/" in path and path.endswith("Runner.kt") for path in paths)
+                and any("ExecuteCmd.kt" in path for path in paths)):
             risks.append(("Dos caminos de ejecución", "Runner.kt y ExecuteCmd.kt", "Inferencia: ambos caminos pueden divergir si evolucionan por separado."))
         cli = next((deps for module, deps in internal if module == "cli"), ())
-        if len(cli) >= 5:
+        if len(cli) >= 5 and not any("cli depende" in item[0].casefold() for item in risks):
             risks.append(("Alto acoplamiento del CLI", "cli/build.gradle", "Inferencia: cambios internos pueden propagarse a la capa CLI."))
         return tuple(risks)
 
@@ -312,7 +324,7 @@ class DeterministicAnalysisSummary:
             "arquitectura", "modules", "build_infrastructure", "module_warning",
             "internal_dependency", "module_versions", "duplicated_test_configuration",
             "root_writes_hooks", "gradle_technology", "language", "build_system",
-            "framework", "dependency", "entry points", "configuración", "documentación",
+            "framework", "dependency", "risk", "entry points", "configuración", "documentación",
         }
 
     @staticmethod

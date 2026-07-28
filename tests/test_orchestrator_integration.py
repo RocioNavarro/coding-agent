@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 from agents.orchestrator import (
-    DeterministicAnalysisPlanGenerator, MainAgent, TaskAnalysis,
+    DeterministicAnalysisPlanGenerator, MainAgent, TaskAnalysis, TextResultPresenter,
 )
 from agents.project_memory import ProjectMemory
 from core.models import EvidenceAssessment, PlanReview
@@ -273,6 +273,28 @@ def test_analysis_summary_metrics_are_emitted_without_duplicate_researcher_metri
     assert "sections=14" in output
     assert "sources=" in output
     assert output.count("[Metrics] Researcher duration=") == 0
+
+
+def test_presenter_limits_sources_and_summarizes_rag_traces() -> None:
+    state = TaskState.create("presentar", task_id="compact-output")
+    state.set_final_result("# Informe técnico\nFuente ya visible: source-0.kt")
+    state.add_subagent_result(SubagentResult(
+        "researcher", "analizar", "completed", summary="resumen " * 100
+    ))
+    for index in range(30):
+        state.add_source(SourceReference("repository", f"source-{index}.kt"))
+    state.add_observation(
+        'RAG trace: {"query":"architecture","retrieved":[1,2,3],'
+        '"used":[1],"discarded":[2,3],"documents":["doc"]}'
+    )
+
+    output = TextResultPresenter().present(state)
+
+    assert "source-0.kt" not in output.removeprefix(state.final_result)
+    assert output.count("[utilizado:repository]") == 16
+    assert "query='architecture'; recuperados=3; utilizados=1; descartados=2; documentos=1" in output
+    assert '"retrieved"' not in output
+    assert "…" in output
 
 
 def test_analysis_can_optionally_run_reviewer_without_implementation() -> None:
