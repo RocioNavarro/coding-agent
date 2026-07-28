@@ -323,7 +323,7 @@ class ResearcherAgent(BaseAgent):
                 print(
                     f"[Metrics] Researcher duration={perf_counter() - started:.2f}s "
                     f"synthesis_mode={'deterministic' if deterministic else 'llm'} "
-                    f"outcome=failed queries={len(queries)} "
+                    f"outcome=failed {self._query_metrics(queries)} "
                     f"chunks_retrieved={len(rag_fragments)} "
                     f"chunks_accepted={len(rag)} "
                     f"chunks_discarded={max(0, len(rag_fragments) - len(rag))} "
@@ -360,7 +360,7 @@ class ResearcherAgent(BaseAgent):
         print(
             f"[Metrics] Researcher duration={perf_counter() - started:.2f}s "
             f"synthesis_mode={'deterministic' if deterministic else 'llm'} "
-            f"outcome=completed queries={len(queries)} "
+            f"outcome=completed {self._query_metrics(queries)} "
             f"chunks_retrieved={len(rag_fragments)} "
             f"chunks_accepted={len(rag)} "
             f"chunks_discarded={max(0, len(rag_fragments) - len(rag))} "
@@ -368,6 +368,15 @@ class ResearcherAgent(BaseAgent):
             f"approx_tokens={(len(output) + 3) // 4}"
         )
         return result
+
+    @staticmethod
+    def _query_metrics(queries: Sequence[ResearchQuery]) -> str:
+        memory_queries = sum(item.provider == "project_memory" for item in queries)
+        rag_queries = sum(item.provider == "rag" for item in queries)
+        return (
+            f"memory_queries={memory_queries} rag_queries={rag_queries} "
+            f"total_research_queries={len(queries)}"
+        )
 
     def build_research_query(
         self,

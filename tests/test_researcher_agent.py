@@ -11,6 +11,7 @@ from agents.researcher import (
     EvidenceSufficiencyEvaluator,
     KnowledgeRetriever,
     ProjectMemoryProvider,
+    ResearchQuery,
     ResearcherAgent,
     SufficiencyAssessment,
     WebSearchProvider,
@@ -526,6 +527,20 @@ def test_visible_fragment_deduplication_keeps_highest_score() -> None:
     result = ResearcherAgent._deduplicate_fragments((low, high))
 
     assert result == (high,)
+
+
+def test_query_metrics_distinguish_memory_rag_and_total() -> None:
+    queries = (
+        ResearchQuery("project_memory", "memoria"),
+        ResearchQuery("rag", "arquitectura"),
+        ResearchQuery("rag", "flujo"),
+        ResearchQuery("rag", "especificación"),
+        ResearchQuery("rag", "tecnologías"),
+    )
+
+    assert ResearcherAgent._query_metrics(queries) == (
+        "memory_queries=1 rag_queries=4 total_research_queries=5"
+    )
 
 
 def test_visible_sources_deduplicate_repeated_web_results() -> None:

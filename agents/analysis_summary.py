@@ -43,7 +43,7 @@ class DeterministicAnalysisSummary:
         paths = self._paths(state, explorer, researcher, findings)
         internal = self._internal_dependencies(findings)
         technologies = self._technologies(findings)
-        entry_points = self._entry_points(findings)
+        entry_points = self._entry_points(state.repository_findings, paths)
         commands = self._commands(state)
         runner_flow = self._runner_flow(findings)
         sources = self._sources(state.sources)
@@ -75,11 +75,8 @@ class DeterministicAnalysisSummary:
 
         sections = [
             "# Informe técnico del repositorio",
-            "## 1. Objetivo general\n" + (
-                self._clip(research_summary, self.MAX_RESEARCH_CHARS)
-                if research_summary else
-                "No se recibió una síntesis técnica de Researcher; se informa sólo evidencia de Explorer."
-            ),
+            "## 1. Objetivo general\n"
+            + self._objective(modules, paths, research_summary, explorer),
             "## 2. Arquitectura general\n" + self._architecture(modules, research_summary),
             "## 3. Módulos y responsabilidades\n" + ("\n".join(responsibilities) or "No confirmados."),
             "## 4. Dependencias internas\n" + self._bullets(
@@ -88,7 +85,7 @@ class DeterministicAnalysisSummary:
             "## 5. Dependencias externas y tecnologías\n" + self._bullets(technologies),
             "## 6. Puntos de entrada y flujo de ejecución\n"
             + self._bullets(f"`{path}`" for path in entry_points)
-            + "\n\nFlujo confirmado por la evidencia disponible: "
+            + "\n\nFlujo principal:\n"
             + ("archivo → FrontendAdapter → Lexer → Parser → AST → Interpreter"
                if self._flow_confirmed(paths, research_summary) else "no confirmado de extremo a extremo.")
             + (f"\n\nCamino alternativo: `runner` conecta {' → '.join(runner_flow)}. "
@@ -167,12 +164,80 @@ class DeterministicAnalysisSummary:
         return tuple(label for token, label in aliases if token in text)
 
     @classmethod
-    def _entry_points(cls, findings: Sequence[str]) -> tuple[str, ...]:
+    def _entry_points(
+        cls, findings: Sequence[str], paths: Sequence[str] = ()
+    ) -> tuple[str, ...]:
         for finding in findings:
             if finding.casefold().startswith("entry points:"):
                 payload = finding.split(":", 1)[1].split(";", 1)[0]
                 return cls._unique(item.strip() for item in payload.split(","))
-        return ()
+        return cls._unique(
+            path for path in paths
+            if path.endswith("/Main.kt")
+            or path.endswith("/commands/ExecuteCmd.kt")
+            or path.endswith("/commands/AnalyzeCmd.kt")
+        )
+
+    def _objective(
+        self,
+        modules: Sequence[str],
+        paths: Sequence[str],
+        research: str,
+        explorer: SubagentResult | None,
+    ) -> str:
+        """Formula el propósito desde capacidades confirmadas y cita evidencia breve."""
+        capabilities = [
+            label for module, label in (
+                ("lexer", "análisis léxico"),
+                ("parser", "análisis sintáctico"),
+                ("interpreter", "interpretación"),
+                ("formatter", "formateo"),
+                ("linter", "linting"),
+                ("cli", "ejecución mediante CLI"),
+            )
+            if module in modules
+        ]
+        context = " ".join((research, explorer.summary if explorer else "")).casefold()
+        subject = "una implementación modular de un lenguaje de programación"
+        if not capabilities and not any(term in context for term in ("lenguaje", "lexer", "parser")):
+            subject = "un repositorio modular"
+        purpose = f"El repositorio contiene {subject}"
+        if capabilities:
+            purpose += " que separa " + self._natural_join(capabilities)
+        purpose += "."
+        supporting = next(
+            (
+                line.strip() for line in research.splitlines()
+                if line.strip()
+                and not line.lstrip().startswith("#")
+                and not line.casefold().startswith((
+                    "evidencia confirmada", "fuentes utilizadas", "inferencia",
+                    "información no confirmada", "coincidencias",
+                ))
+            ),
+            "",
+        )
+        if supporting:
+            purpose += "\n\n" + self._clip(supporting, self.MAX_ITEM_CHARS)
+        elif explorer is not None:
+            purpose += "\n\nNo se recibió una síntesis técnica de Researcher; el objetivo se derivó de Explorer."
+        preferred = (
+            "docs/printscript-language-spec.md", "settings.gradle.kts",
+            "cli/src/main/kotlin/org/printscript/cli/Main.kt",
+        )
+        evidence = [path for path in preferred if path in paths][:3]
+        if not evidence:
+            evidence = list(paths[:3])
+        return purpose + (
+            "\n\nArchivos de respaldo: " + ", ".join(evidence) + "."
+            if evidence else "\n\nNo se confirmaron archivos de respaldo específicos."
+        )
+
+    @staticmethod
+    def _natural_join(values: Sequence[str]) -> str:
+        if len(values) < 2:
+            return "".join(values)
+        return ", ".join(values[:-1]) + " y " + values[-1]
 
     @classmethod
     def _commands(cls, state: TaskState) -> tuple[str, ...]:

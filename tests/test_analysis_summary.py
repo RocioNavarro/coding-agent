@@ -108,6 +108,54 @@ def test_builds_complete_bounded_printscript_report_from_research_and_explorer()
     assert len(report) <= DeterministicAnalysisSummary.MAX_OUTPUT_CHARS
 
 
+def test_objective_is_functional_and_does_not_start_with_research_inventory() -> None:
+    report = DeterministicAnalysisSummary().build(printscript_state())
+    objective = report.split("## 1. Objetivo general\n", 1)[1].split("\n\n## 2.", 1)[0]
+
+    assert objective.startswith(
+        "El repositorio contiene una implementación modular de un lenguaje"
+    )
+    assert "análisis léxico" in objective
+    assert "interpretación" in objective
+    assert not objective.startswith("Evidencia confirmada")
+    assert objective.count("`") <= 6
+
+
+def test_confirmed_entry_points_are_listed_before_flows() -> None:
+    report = DeterministicAnalysisSummary().build(printscript_state())
+    section = report.split("## 6. Puntos de entrada y flujo de ejecución\n", 1)[1].split(
+        "\n\n## 7.", 1
+    )[0]
+
+    for path in (
+        "cli/src/main/kotlin/org/printscript/cli/Main.kt",
+        "lexer/src/main/kotlin/org/printscript/lexer/Main.kt",
+        "cli/src/main/kotlin/org/printscript/cli/commands/ExecuteCmd.kt",
+        "cli/src/main/kotlin/org/printscript/cli/commands/AnalyzeCmd.kt",
+    ):
+        assert f"`{path}`" in section
+    assert "No confirmado" not in section
+    assert section.index("Main.kt`") < section.index("Flujo principal:")
+    assert "InputStream → Lexer → Parser → Interpreter" in section
+
+
+def test_missing_entry_points_are_reported_as_unconfirmed() -> None:
+    state = TaskState.create("Analizar repositorio", task_id="without-entry-points")
+    state.add_repository_finding("modules=lexer, parser, interpreter")
+    for path in (
+        "lexer/src/main/kotlin/example/Lexer.kt",
+        "parser/src/main/kotlin/example/Parser.kt",
+        "interpreter/src/main/kotlin/example/Interpreter.kt",
+    ):
+        state.add_source(SourceReference("repository", path))
+
+    report = DeterministicAnalysisSummary().build(state)
+    section = report.split("## 6. Puntos de entrada y flujo de ejecución\n", 1)[1].split(
+        "\n\n## 7.", 1
+    )[0]
+    assert section.startswith("- No confirmado.")
+
+
 def test_report_remains_structured_without_researcher_summary() -> None:
     report = DeterministicAnalysisSummary().build(printscript_state(with_researcher=False))
 
