@@ -7,3 +7,4 @@ data/vector_store/
 data/project_memory/
 .idea/
 agent.config.yaml
+*.iml

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from urllib.parse import urlparse
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -292,7 +293,7 @@ class BaseAgent(ABC):
 
         summary = self._payload_text(payload, "summary")
         sources = tuple(
-            SourceReference.from_dict(source)
+            self._source_reference(source)
             for source in self._payload_list(payload, "sources")
         )
         return SubagentResult(
@@ -309,6 +310,17 @@ class BaseAgent(ABC):
             blockers=self._payload_text_list(payload, "blockers"),
             confidence=self._confidence(payload.get("confidence")),
         )
+
+    @staticmethod
+    def _source_reference(value: Mapping[str, Any]) -> SourceReference:
+        """Normaliza una ruta local mal etiquetada como web por una salida LLM."""
+        data = dict(value)
+        reference = data.get("reference")
+        if data.get("origin") == "web" and isinstance(reference, str):
+            parsed = urlparse(reference)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                data["origin"] = "repository"
+        return SourceReference.from_dict(data)
 
     def _allowed_schemas(self, available_tools: ToolRegistry) -> list[dict[str, Any]]:
         schemas: list[dict[str, Any]] = []

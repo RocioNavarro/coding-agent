@@ -475,3 +475,118 @@ def test_processing_flow_is_confirmed_with_repository_and_rag() -> None:
     finding = ResearcherAgent._processing_flow_corroboration((fragment,), state)
 
     assert finding.startswith("HECHO CONFIRMADO")
+
+
+def test_analysis_uses_deterministic_synthesis_without_llm(capsys) -> None:
+    events: list[str] = []
+    llm = FakeLLM()
+    researcher = ResearcherAgent(
+        llm_client=llm,
+        project_memory=FakeMemory(events, []),
+        knowledge_retriever=TracedRAG(
+            events,
+            [EvidenceFragment(
+                "rag", "rag://spec/flow", "lexer parser interpreter", 0.9,
+                {"source_name": "printscript-language-spec", "section": "Arquitectura de procesamiento"},
+            )],
+        ),
+        sufficiency_evaluator=ScriptedEvaluator(events, True),
+    )
+    state = populated_state()
+    state.add_repository_finding("modules=lexer, parser, interpreter")
+    state.add_observation("Tarea clasificada como analysis: prueba")
+
+    result = researcher.run("Analizar arquitectura", state)
+
+    assert llm.messages == []
+    assert result.subagent_result.status == "completed"
+    assert "HECHO CONFIRMADO" in result.technical_summary
+    assert "synthesis_mode=deterministic" in capsys.readouterr().out
+    assert any(item.startswith("RAG trace: ") for item in state.observations)
+
+
+def test_processing_flow_evidence_levels() -> None:
+    rag = EvidenceFragment(
+        "rag", "rag://spec/flow", "lexer parser interpreter", 0.9,
+        {"source_name": "printscript-language-spec", "section": "Arquitectura de procesamiento"},
+    )
+    repository_only = TaskState.create("flujo")
+    repository_only.add_repository_finding("modules=lexer, parser, interpreter")
+    empty = TaskState.create("flujo")
+
+    assert ResearcherAgent._processing_flow_corroboration((), repository_only).startswith("CONFIRMACIÓN PARCIAL")
+    assert ResearcherAgent._processing_flow_corroboration((rag,), empty).startswith("CONFIRMACIÓN PARCIAL")
+    assert ResearcherAgent._processing_flow_corroboration((), empty).startswith("NO CONFIRMADO")
+
+
+def test_visible_fragment_deduplication_keeps_highest_score() -> None:
+    low = EvidenceFragment("rag", "rag://same", "old", 0.5, {"chunk_id": "one"})
+    high = EvidenceFragment("rag", "rag://same", "new", 0.9, {"chunk_id": "one"})
+
+    result = ResearcherAgent._deduplicate_fragments((low, high))
+
+    assert result == (high,)
+
+
+def test_visible_sources_deduplicate_repeated_web_results() -> None:
+    events: list[str] = []
+    repeated = (
+        EvidenceFragment("web", "https://official.test/api", "old", 0.5),
+        EvidenceFragment("web", "https://official.test/api", "new", 0.9),
+    )
+    researcher = ResearcherAgent(
+        llm_client=FakeLLM(),
+        project_memory=FakeMemory(events, []),
+        knowledge_retriever=FakeRAG(events, []),
+        web_search=FakeWeb(events, repeated),
+        sufficiency_evaluator=ScriptedEvaluator(events, False),
+    )
+
+    result = researcher.run("Investigar documentación", populated_state())
+
+    visible = [
+        source for source in result.sources_recovered
+        if source.reference == "https://official.test/api"
+    ]
+    assert len(visible) == 1
+    assert [item.content for item in result.fragments_used if item.origin == "web"] == [
+        "new"
+    ]
+
+
+def test_partial_research_survives_later_synthesis_failure(
+    monkeypatch, capsys
+) -> None:
+    events: list[str] = []
+    researcher = ResearcherAgent(
+        llm_client=FakeLLM(),
+        project_memory=FakeMemory(events, []),
+        knowledge_retriever=TracedRAG(
+            events, [fragment("rag", "rag://doc/1", "evidencia")]
+        ),
+        sufficiency_evaluator=ScriptedEvaluator(events, True),
+    )
+    state = populated_state()
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("timeout simulado")
+
+    monkeypatch.setattr(researcher, "_synthesize", fail)
+    with pytest.raises(Exception, match="timeout simulado"):
+        researcher.run("Investigar", state)
+
+    trace = next(item for item in state.observations if item.startswith("RAG trace: "))
+    payload = json.loads(trace.removeprefix("RAG trace: "))
+    assert payload["retrieved"][0]["chunk_id"] == "chunk-1"
+    assert payload["used"][0]["score"] == 0.91
+    assert SourceReference("rag", "rag://doc/1", "evidencia") in state.sources
+    partial = next(
+        item for item in state.observations
+        if item.startswith("Researcher partial result: ")
+    )
+    partial_payload = json.loads(partial.removeprefix("Researcher partial result: "))
+    assert partial_payload["sources_recovered"][-1]["reference"] == "rag://doc/1"
+    assert partial_payload["queries_performed"][-1]["provider"] == "rag"
+    metrics = capsys.readouterr().out
+    assert "outcome=failed" in metrics
+    assert "unique_sources=" in metrics

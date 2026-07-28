@@ -433,6 +433,12 @@ class TaskState:
     def add_source(self, source: SourceReference) -> None:
         if not isinstance(source, SourceReference):
             raise TypeError("source debe ser una instancia de SourceReference.")
+        if any(
+            existing.origin == source.origin
+            and existing.reference == source.reference
+            for existing in self._sources
+        ):
+            return
         self._sources.append(source)
 
     def add_repository_finding(self, finding: str) -> None:

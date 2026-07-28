@@ -205,3 +205,34 @@ def test_agent_result_preserves_json_round_trip() -> None:
     restored = TaskState.from_json(state.to_json())
 
     assert restored == state
+
+
+def test_normalizes_local_path_mislabeled_as_web() -> None:
+    source = StubAgent._source_reference({
+        "origin": "web",
+        "reference": "docs/printscript-language-spec.md",
+        "summary": "Especificación local",
+    })
+
+    assert source.origin == "repository"
+
+
+def test_preserves_http_source_as_web() -> None:
+    source = StubAgent._source_reference({
+        "origin": "web",
+        "reference": "https://kotlinlang.org/docs/null-safety.html",
+    })
+
+    assert source.origin == "web"
+
+
+def test_task_state_deduplicates_sources_by_origin_and_reference() -> None:
+    state = TaskState.create("Deduplicar fuentes")
+    state.add_source(SourceReference("rag", "rag://doc/1", "Primera versión"))
+    state.add_source(SourceReference("rag", "rag://doc/1", "Resumen repetido"))
+    state.add_source(SourceReference("web", "rag://doc/1", "Otro origen"))
+
+    assert state.sources == (
+        SourceReference("rag", "rag://doc/1", "Primera versión"),
+        SourceReference("web", "rag://doc/1", "Otro origen"),
+    )

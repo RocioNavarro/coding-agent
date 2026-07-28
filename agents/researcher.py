@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from time import perf_counter
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Sequence
@@ -193,6 +194,7 @@ class ResearcherAgent(BaseAgent):
     ) -> ResearcherResult:
         if not isinstance(task_state, TaskState):
             raise TypeError("task_state debe ser una instancia de TaskState.")
+        started = perf_counter()
         queries: list[ResearchQuery] = []
         rag_audits: list[Mapping[str, Any]] = []
         web_audit: Mapping[str, Any] | None = None
@@ -221,10 +223,14 @@ class ResearcherAgent(BaseAgent):
                 audit = self.knowledge_retriever.retrieval_audit()
                 if audit:
                     rag_audits.append(audit)
+                    task_state.add_observation(
+                        "RAG trace: "
+                        + json.dumps(self._compact_rag_audit(audit), ensure_ascii=False)
+                    )
             rag = self._deduplicate_rag(rag_fragments)
 
             repository = self._repository_fragments(task_state, context)
-            fragments = [*repository, *memory, *rag]
+            fragments = list(self._deduplicate_fragments((*repository, *memory, *rag)))
             print(
                 f"[Metrics] RAG queries={len(rag_audits)} "
                 f"chunks_retrieved={len(rag_fragments)} "
@@ -251,6 +257,13 @@ class ResearcherAgent(BaseAgent):
                     "web",
                 )
                 web_audit = self.web_search.search_audit()
+                if web_audit:
+                    task_state.add_observation(
+                        "WEB trace: "
+                        + json.dumps(
+                            self._compact_web_audit(web_audit), ensure_ascii=False
+                        )
+                    )
                 fragments.extend(web)
                 web_used = True
                 final_assessment = self.sufficiency_evaluator.evaluate(query, fragments)
@@ -259,7 +272,8 @@ class ResearcherAgent(BaseAgent):
 
             missing = final_assessment.missing_information
             if web_needed and self.web_search is None:
-                missing = (*missing, "La búsqueda web no está configurada.")
+                if not self._is_analysis(task_state):
+                    missing = (*missing, "La búsqueda web no está configurada.")
                 task_state.add_observation(
                     "WEB trace: "
                     + json.dumps(
@@ -274,19 +288,49 @@ class ResearcherAgent(BaseAgent):
                     )
                 )
 
-            subagent_result = self._synthesize(
-                instruction,
-                task_state,
-                context,
-                queries,
-                fragments,
-                final_assessment,
-                missing,
+            fragments = list(self._deduplicate_fragments(fragments))
+            sources = tuple(fragment.to_source() for fragment in fragments)
+            for source in sources:
+                task_state.add_source(source)
+            task_state.add_observation(
+                "Researcher partial result: "
+                + json.dumps(
+                    {
+                        "queries_performed": [
+                            {"provider": item.provider, "text": item.text}
+                            for item in queries
+                        ],
+                        "sources_recovered": [
+                            source.to_dict() for source in sources
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
             )
+            deterministic = self._is_analysis(task_state)
+            try:
+                subagent_result = (
+                    self._synthesize_deterministic(
+                        instruction, task_state, fragments, final_assessment, missing
+                    )
+                    if deterministic
+                    else self._synthesize(
+                        instruction, task_state, context, queries, fragments,
+                        final_assessment, missing,
+                    )
+                )
+            except Exception:
+                print(
+                    f"[Metrics] Researcher duration={perf_counter() - started:.2f}s "
+                    f"synthesis_mode={'deterministic' if deterministic else 'llm'} "
+                    f"outcome=failed queries={len(queries)} "
+                    f"chunks_retrieved={len(rag_fragments)} "
+                    f"chunks_accepted={len(rag)} "
+                    f"chunks_discarded={max(0, len(rag_fragments) - len(rag))} "
+                    f"unique_sources={len(sources)} output_chars=0 approx_tokens=0"
+                )
+                raise
 
-        sources = tuple(fragment.to_source() for fragment in fragments)
-        for source in sources:
-            task_state.add_source(source)
         task_state.add_source(
             SourceReference(
                 "inference",
@@ -301,17 +345,7 @@ class ResearcherAgent(BaseAgent):
             f"Researcher usó web: {'sí' if web_used else 'no'}; "
             f"confianza: {final_assessment.confidence:.2f}."
         )
-        for rag_audit in rag_audits:
-            task_state.add_observation(
-                "RAG trace: "
-                + json.dumps(self._compact_rag_audit(rag_audit), ensure_ascii=False)
-            )
-        if web_audit:
-            task_state.add_observation(
-                "WEB trace: "
-                + json.dumps(self._compact_web_audit(web_audit), ensure_ascii=False)
-            )
-        return ResearcherResult(
+        result = ResearcherResult(
             queries_performed=tuple(queries),
             sources_recovered=sources,
             fragments_used=tuple(fragments),
@@ -322,6 +356,18 @@ class ResearcherAgent(BaseAgent):
             web_used=web_used,
             subagent_result=subagent_result,
         )
+        output = result.technical_summary
+        print(
+            f"[Metrics] Researcher duration={perf_counter() - started:.2f}s "
+            f"synthesis_mode={'deterministic' if deterministic else 'llm'} "
+            f"outcome=completed queries={len(queries)} "
+            f"chunks_retrieved={len(rag_fragments)} "
+            f"chunks_accepted={len(rag)} "
+            f"chunks_discarded={max(0, len(rag_fragments) - len(rag))} "
+            f"unique_sources={len(sources)} output_chars={len(output)} "
+            f"approx_tokens={(len(output) + 3) // 4}"
+        )
+        return result
 
     def build_research_query(
         self,
@@ -566,6 +612,51 @@ class ResearcherAgent(BaseAgent):
             confidence=assessment.confidence,
         )
 
+    def _synthesize_deterministic(
+        self,
+        instruction: str,
+        state: TaskState,
+        fragments: Sequence[EvidenceFragment],
+        assessment: SufficiencyAssessment,
+        missing: Sequence[str],
+    ) -> SubagentResult:
+        """Sintetiza evidencia de analysis localmente, sin invocar al LLM."""
+        repository = [item for item in fragments if item.origin == "repository"]
+        rag = [item for item in fragments if item.origin == "rag"]
+        memory = [item for item in fragments if item.origin == "project_memory"]
+        corroboration = self._processing_flow_corroboration(fragments, state)
+
+        def references(items: Sequence[EvidenceFragment], limit: int = 10) -> str:
+            return ", ".join(item.reference for item in items[:limit]) or "Ninguna."
+
+        useful_missing = tuple(
+            item for item in missing if "búsqueda web" not in item.casefold()
+        )
+        sections = [
+            "Evidencia confirmada del repositorio: " + references(repository),
+            "Evidencia confirmada por RAG: " + references(rag),
+            "Coincidencias entre repositorio y RAG: " + corroboration,
+            "Inferencias razonables: las responsabilidades detalladas deben validarse contra los archivos citados.",
+            "Información no confirmada: " + ("; ".join(useful_missing) or "Ninguna adicional."),
+            "Fuentes utilizadas: " + references(fragments, 16),
+            "Evidencia descartada o insuficiente: consultar las entradas RAG trace del estado.",
+        ]
+        summary = "\n".join(sections)
+        has_minimum = bool(repository or rag or memory)
+        return SubagentResult(
+            subagent_id=self.name,
+            task=instruction,
+            status="completed" if has_minimum else "blocked",
+            result=summary,
+            summary=summary,
+            findings=(corroboration,),
+            recommendations=useful_missing,
+            sources=tuple(item.to_source() for item in fragments),
+            files_relevant=tuple(item.reference for item in repository[:20]),
+            blockers=() if has_minimum else ("No se recuperó evidencia mínima.",),
+            confidence=assessment.confidence if has_minimum else 0.0,
+        )
+
     @staticmethod
     def _deduplicate_rag(
         fragments: Sequence[EvidenceFragment], *, limit: int = 6
@@ -577,6 +668,32 @@ class ResearcherAgent(BaseAgent):
             if previous is None or fragment.relevance > previous.relevance:
                 best[key] = fragment
         return tuple(sorted(best.values(), key=lambda item: item.relevance, reverse=True)[:limit])
+
+    @staticmethod
+    def _deduplicate_fragments(
+        fragments: Sequence[EvidenceFragment],
+    ) -> tuple[EvidenceFragment, ...]:
+        best: dict[tuple[str, str, str, str, str], EvidenceFragment] = {}
+        for fragment in fragments:
+            metadata = fragment.metadata or {}
+            key = (
+                fragment.origin,
+                str(metadata.get("source_name", "")),
+                str(metadata.get("path_or_url", fragment.reference)),
+                str(metadata.get("section", "")),
+                str(metadata.get("chunk_id", fragment.reference)),
+            )
+            previous = best.get(key)
+            if previous is None or fragment.relevance > previous.relevance:
+                best[key] = fragment
+        return tuple(best.values())
+
+    @staticmethod
+    def _is_analysis(state: TaskState) -> bool:
+        return any(
+            observation.startswith("Tarea clasificada como analysis:")
+            for observation in state.observations
+        )
 
     @staticmethod
     def _processing_flow_corroboration(
