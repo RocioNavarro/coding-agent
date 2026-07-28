@@ -103,6 +103,11 @@ class ExplorerReport:
     declared_modules: tuple[str, ...] = ()
     build_infrastructure: tuple[str, ...] = ()
     module_warnings: tuple[str, ...] = ()
+    internal_dependencies: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    module_versions: Mapping[str, str] = field(default_factory=dict)
+    documented_gradle_commands: tuple[str, ...] = ()
+    gradle_risks: tuple[str, ...] = ()
+    gradle_technologies: tuple[str, ...] = ()
 
     def facts(self) -> tuple[str, ...]:
         facts = [f"Resumen de arquitectura: {self.architecture_summary}"]
@@ -250,6 +255,9 @@ class ExplorerAgent(BaseAgent):
         modules, build_infrastructure, module_warnings = self._gradle_modules(
             inventory, contents
         )
+        internal_dependencies, module_versions, gradle_commands, gradle_risks, gradle_technologies = (
+            self._gradle_evidence(contents)
+        )
         snapshot = RepositorySnapshot(
             files=inventory.files,
             directories=inventory.directories,
@@ -275,6 +283,11 @@ class ExplorerAgent(BaseAgent):
             declared_modules=modules,
             build_infrastructure=build_infrastructure,
             module_warnings=module_warnings,
+            internal_dependencies=internal_dependencies,
+            module_versions=module_versions,
+            documented_gradle_commands=gradle_commands,
+            gradle_risks=gradle_risks,
+            gradle_technologies=gradle_technologies,
         )
 
     def _scan(self) -> tuple[RepositoryInventory, dict[str, str], dict[str, object]]:
@@ -565,6 +578,27 @@ class ExplorerAgent(BaseAgent):
             )
         for warning in report.module_warnings:
             state.add_repository_finding(f"module_warning={warning}")
+        for module, dependencies in report.internal_dependencies.items():
+            state.add_repository_finding(
+                f"internal_dependency={module} -> {', '.join(dependencies)}; "
+                f"evidencia: {module}/build.gradle."
+            )
+        if report.module_versions:
+            state.add_repository_finding(
+                "module_versions="
+                + ", ".join(f"{name}:{version}" for name, version in report.module_versions.items())
+                + "; evidencia: build.gradle de cada módulo."
+            )
+        for risk in report.gradle_risks:
+            state.add_repository_finding(risk)
+        for technology in report.gradle_technologies:
+            state.add_repository_finding(
+                f"gradle_technology={technology}; evidencia: configuración Gradle."
+            )
+        for command in report.documented_gradle_commands:
+            state.add_observation(
+                f"Comando detectado: {command}; evidencia: archivos Gradle, scripts o CI."
+            )
         artifact_groups = (
             ("configuración", report.inventory.configuration_files),
             ("documentación", report.inventory.documentation_files),
@@ -594,6 +628,62 @@ class ExplorerAgent(BaseAgent):
                 )
         for path in report.inventory.files_inspected:
             state.record_file_read(path)
+
+    @staticmethod
+    def _gradle_evidence(
+        contents: Mapping[str, str],
+    ) -> tuple[
+        dict[str, tuple[str, ...]], dict[str, str], tuple[str, ...],
+        tuple[str, ...], tuple[str, ...]
+    ]:
+        """Extrae relaciones y señales Gradle sin ejecutar el build."""
+        dependencies: dict[str, tuple[str, ...]] = {}
+        versions: dict[str, str] = {}
+        commands: list[str] = []
+        risks: list[str] = []
+        test_blocks: dict[str, str] = {}
+        for path, content in contents.items():
+            if path.endswith("/build.gradle") or path.endswith("/build.gradle.kts"):
+                module = path.split("/", 1)[0]
+                declared = tuple(dict.fromkeys(re.findall(r"project\s*\(\s*['\"]:([^'\"]+)", content)))
+                if declared:
+                    dependencies[module] = declared
+                version = re.search(r"(?m)^version\s*=\s*['\"]([^'\"]+)", content)
+                if version:
+                    versions[module] = version.group(1)
+                test_block = re.search(r"(?s)test\s*\{(.{1,800}?)\n\}", content)
+                if test_block:
+                    test_blocks[module] = " ".join(test_block.group(1).split())
+            commands.extend(re.findall(r"(\./gradlew(?:\.bat)?\s+[\w:-]+)", content))
+        duplicates: dict[str, list[str]] = {}
+        for module, block in test_blocks.items():
+            duplicates.setdefault(block, []).append(module)
+        repeated = [names for names in duplicates.values() if len(names) > 1]
+        if repeated:
+            risks.append(
+                "duplicated_test_configuration="
+                + ", ".join("/".join(names) for names in repeated)
+                + "; evidencia: build.gradle de esos módulos."
+            )
+        root_build = contents.get("build.gradle.kts", "") or contents.get("build.gradle", "")
+        if "installGitHooks" in root_build and any(
+            token in root_build for token in ("writeText", "Files.copy", ".git/hooks")
+        ):
+            risks.append("root_writes_hooks=installGitHooks; evidencia: build.gradle.kts.")
+        all_content = "\n".join(contents.values()).casefold()
+        technologies = ["Gradle"]
+        for token, label in (
+            ("kotlin", "Kotlin"), ("javalanguageversion", "Java toolchain"),
+            ("picocli", "Picocli"), ("gson", "Gson"), ("junit", "JUnit"),
+            ("kotlin-test", "Kotlin Test"), ("spotless", "Spotless"),
+            ("foojay", "Foojay"),
+        ):
+            if token in all_content:
+                technologies.append(label)
+        return (
+            dependencies, versions, tuple(dict.fromkeys(commands)), tuple(risks),
+            tuple(technologies),
+        )
 
     def _record_memory(self, report: ExplorerReport) -> None:
         if self.project_memory is None:

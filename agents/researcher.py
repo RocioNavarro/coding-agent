@@ -232,7 +232,7 @@ class ResearcherAgent(BaseAgent):
             repository = self._repository_fragments(task_state, context)
             fragments = list(self._deduplicate_fragments((*repository, *memory, *rag)))
             print(
-                f"[Metrics] RAG queries={len(rag_audits)} "
+                f"[Metrics] RAG scope=researcher_total queries={len(rag_audits)} "
                 f"chunks_retrieved={len(rag_fragments)} "
                 f"chunks_accepted={len(rag)} "
                 f"chunks_discarded={max(0, len(rag_fragments) - len(rag))}"

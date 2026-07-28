@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from collections.abc import Callable
 from typing import Literal, Protocol, Sequence
 
+from agents.analysis_summary import DeterministicAnalysisSummary
 from agents.base import AgentContext, AgentExecutionError
 from agents.implementer import ImplementerResult
 from agents.project_memory import (
@@ -491,9 +492,7 @@ class MainAgent:
                     task_id=state.task_id,
                     parent_event_id=f"{state.task_id}:researcher:0", agent="researcher",
                 ):
-                    started = perf_counter()
                     research = self.researcher.run(request, state, profile_context)
-                    print(f"[Metrics] Researcher duration={perf_counter() - started:.2f}s")
                 selected.append("researcher")
                 self._record_agent(state, "researcher", 0)
                 if research.subagent_result.status != "completed":
@@ -546,7 +545,20 @@ class MainAgent:
                 state.approve_plan(plan)
 
                 if analysis.kind == "analysis":
+                    started = perf_counter()
                     analysis_summary = self._analysis_summary(state)
+                    source_count = len({
+                        (source.origin, source.reference) for source in state.sources
+                        if source.origin != "inference"
+                    })
+                    print(
+                        f"[Metrics] AnalysisSummary "
+                        f"duration={perf_counter() - started:.2f}s "
+                        f"output_chars={len(analysis_summary)} "
+                        f"approx_tokens={(len(analysis_summary) + 3) // 4} "
+                        f"sections={analysis_summary.count('## ')} "
+                        f"sources={min(source_count, DeterministicAnalysisSummary.MAX_SOURCES)}"
+                    )
                     if self.review_analysis_tasks:
                         if self.reviewer is None:
                             return self._blocked(
@@ -899,8 +911,7 @@ class MainAgent:
 
     @staticmethod
     def _analysis_summary(state: TaskState) -> str:
-        findings = "\n".join(f"- {item}" for item in state.repository_findings)
-        return "Análisis completado sin cambios.\n" + (findings or "Sin hallazgos.")
+        return DeterministicAnalysisSummary().build(state)
 
     @staticmethod
     def _evidence_blocked_reason(assessment: EvidenceAssessment) -> str:

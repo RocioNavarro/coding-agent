@@ -253,7 +253,26 @@ def test_analysis_without_changes_selects_only_needed_agents() -> None:
     assert result.selected_agents == ("explorer",)
     assert implementer.calls == tester.calls == reviewer.calls == 0
     assert result.task_state.files_modified == ()
-    assert "Análisis completado sin cambios" in result.final_response
+    assert "# Informe técnico del repositorio" in result.final_response
+
+
+def test_analysis_summary_metrics_are_emitted_without_duplicate_researcher_metric(
+    capsys,
+) -> None:
+    researcher = FakeResearcher()
+    agent, _, _, _, _ = build_agent(kind="analysis", researcher=researcher)
+    agent.task_analyzer.result = TaskAnalysis("analysis", True, "requiere evidencia")
+
+    result = agent.run("Explicar arquitectura", approve, task_id="analysis-metrics")
+
+    output = capsys.readouterr().out
+    assert result.status == "completed"
+    assert "[Metrics] AnalysisSummary duration=" in output
+    assert "output_chars=" in output
+    assert "approx_tokens=" in output
+    assert "sections=14" in output
+    assert "sources=" in output
+    assert output.count("[Metrics] Researcher duration=") == 0
 
 
 def test_analysis_can_optionally_run_reviewer_without_implementation() -> None:
