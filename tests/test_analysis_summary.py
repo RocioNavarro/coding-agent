@@ -1,5 +1,7 @@
 """Síntesis determinística del informe final de tareas analysis."""
 
+import pytest
+
 from agents.analysis_summary import DeterministicAnalysisSummary
 from agents.explorer import ExplorerAgent
 from core.task_state import SourceReference, SubagentResult, TaskState
@@ -27,6 +29,10 @@ def printscript_state(*, with_researcher: bool = True) -> TaskState:
     state.add_repository_finding("module_versions=cli:1.5-SNAPSHOT, formatter:3.2-SNAPSHOT")
     state.add_repository_finding("duplicated_test_configuration=runner/interpreter")
     state.add_repository_finding("root_writes_hooks=installGitHooks; evidencia: build.gradle.kts.")
+    state.add_repository_finding(
+        "runner_flow=InputStream -> Lexer -> Parser -> Interpreter; "
+        "evidencia: runner/src/main/kotlin/org/printscript/runner/Runner.kt."
+    )
     state.add_repository_finding(
         "gradle_technology=Kotlin, Java toolchain, Gradle, Picocli, Gson, JUnit, "
         "Kotlin Test, Spotless, Foojay"
@@ -122,7 +128,7 @@ def test_raw_inventory_is_bounded_and_not_dumped() -> None:
 
 
 def test_explorer_persists_gradle_evidence_without_running_commands() -> None:
-    dependencies, versions, commands, risks, technologies = ExplorerAgent._gradle_evidence({
+    dependencies, test_dependencies, versions, commands, risks, technologies, runner_flow = ExplorerAgent._gradle_evidence({
         "cli/build.gradle": (
             "version = '1.0'\nimplementation project(':lexer')\n"
             "implementation 'info.picocli:picocli:4.7.6'"
@@ -142,8 +148,79 @@ def test_explorer_persists_gradle_evidence_without_running_commands() -> None:
     })
 
     assert dependencies == {"cli": ("lexer",)}
+    assert test_dependencies == {}
     assert versions == {"cli": "1.0", "lexer": "2.0"}
     assert {"./gradlew spotlessApply", "./gradlew build", "./gradlew check"} <= set(commands)
     assert any("instala hooks" in item for item in risks)
     assert "Gradle" in technologies
     assert any(item.startswith("Java toolchain 21") for item in technologies)
+    assert runner_flow == ()
+
+
+def test_gradle_internal_dependencies_keep_production_and_test_scopes_separate() -> None:
+    production, tests, *_ = ExplorerAgent._gradle_evidence({
+        "parser/build.gradle": """
+            implementation project(':token')
+            api project(':common')
+            compileOnly project(':annotations')
+            runtimeOnly project(':runtime')
+            testImplementation project(':lexer')
+            testRuntimeOnly project(':test-runtime')
+            testCompileOnly project(':test-annotations')
+            testFixturesImplementation project(':fixtures')
+        """,
+        "api/build.gradle.kts": "implementation(project(\":common\"))",
+    })
+
+    assert production == {
+        "parser": ("token", "common", "annotations", "runtime"),
+        "api": ("common",),
+    }
+    assert tests == {
+        "parser": ("lexer", "test-runtime", "test-annotations", "fixtures"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    (
+        ("./gradlew check", "./gradlew check"),
+        ("./gradlew -q check", "./gradlew check"),
+        ("./gradlew --quiet check", "./gradlew check"),
+        ("./gradlew -q spotlessApply", "./gradlew spotlessApply"),
+        ("./gradlew --no-daemon test", "./gradlew test"),
+        ("./gradlew -p subproject build", "./gradlew build"),
+        ("./gradlew --project-dir subproject build", "./gradlew build"),
+        ("./gradlew --stacktrace jacocoTestReport", "./gradlew jacocoTestReport"),
+        ("./gradlew -Dkey=value -Pprofile=ci publish", "./gradlew publish"),
+    ),
+)
+def test_normalizes_gradle_commands_with_options(raw: str, expected: str) -> None:
+    assert ExplorerAgent._gradle_commands(raw) == (expected,)
+
+
+def test_gradle_commands_discard_incomplete_flags_and_deduplicate() -> None:
+    content = "./gradlew -q\n./gradlew -q check\n./gradlew --quiet check"
+
+    assert ExplorerAgent._gradle_commands(content) == ("./gradlew check",)
+
+
+def test_runner_flow_requires_input_stream_and_pipeline_operations() -> None:
+    base = {
+        "runner/src/main/kotlin/org/example/runner/Runner.kt": (
+            "fun run(input: InputStream) { val reader = InputStreamReader(input); "
+            "val lexer = Lexer(provider); val tokens = lexer.lex(reader); "
+            "val parser: Parser = parser; val ast = parser.parse(tokens); "
+            "val interpreter: Interpreter = interpreter; interpreter.executeNode(ast.first()) }"
+        )
+    }
+    *_, flow = ExplorerAgent._gradle_evidence(base)
+    *_, short_flow = ExplorerAgent._gradle_evidence({
+        "runner/src/main/kotlin/org/example/runner/Runner.kt": (
+            "val lexer = Lexer(provider); lexer.lex(reader); parser.parse(tokens); "
+            "interpreter.executeNode(node); Parser; Interpreter"
+        )
+    })
+
+    assert flow == ("InputStream", "Lexer", "Parser", "Interpreter")
+    assert short_flow == ("Lexer", "Parser", "Interpreter")

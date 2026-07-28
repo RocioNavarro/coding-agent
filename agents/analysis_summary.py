@@ -45,6 +45,7 @@ class DeterministicAnalysisSummary:
         technologies = self._technologies(findings)
         entry_points = self._entry_points(findings)
         commands = self._commands(state)
+        runner_flow = self._runner_flow(findings)
         sources = self._sources(state.sources)
         research_summary = self._research_summary(researcher)
         uncertainties = self._unique(
@@ -90,8 +91,9 @@ class DeterministicAnalysisSummary:
             + "\n\nFlujo confirmado por la evidencia disponible: "
             + ("archivo → FrontendAdapter → Lexer → Parser → AST → Interpreter"
                if self._flow_confirmed(paths, research_summary) else "no confirmado de extremo a extremo.")
-            + ("\n\nCamino alternativo: `runner` conecta Lexer → Parser → Interpreter."
-               if any("runner/" in path and path.endswith("Runner.kt") for path in paths) else ""),
+            + (f"\n\nCamino alternativo: `runner` conecta {' → '.join(runner_flow)}. "
+               "Evidencia: `runner/src/main/kotlin/org/printscript/runner/Runner.kt`."
+               if runner_flow else ""),
             "## 7. Rol de los componentes principales\n" + self._component_roles(responsibilities),
             "## 8. Organización de Gradle\n" + self._gradle(modules, evidence_text),
             "## 9. Comandos documentados\n" + self._bullets(f"`{item}`" for item in commands),
@@ -179,6 +181,13 @@ class DeterministicAnalysisSummary:
             if item.startswith("Comando detectado: "):
                 commands.append(item.removeprefix("Comando detectado: ").split("; evidencia:", 1)[0])
         return cls._unique(commands)
+
+    @classmethod
+    def _runner_flow(cls, findings: Sequence[str]) -> tuple[str, ...]:
+        values = cls._values(findings, "runner_flow=")
+        if not values:
+            return ()
+        return tuple(item.strip() for item in values[0].split("->") if item.strip())
 
     @classmethod
     def _paths(
@@ -322,7 +331,8 @@ class DeterministicAnalysisSummary:
         category = value.split("=", 1)[0].split(":", 1)[0].strip().casefold()
         return category in {
             "arquitectura", "modules", "build_infrastructure", "module_warning",
-            "internal_dependency", "module_versions", "duplicated_test_configuration",
+            "internal_dependency", "test_internal_dependency", "runner_flow",
+            "module_versions", "duplicated_test_configuration",
             "root_writes_hooks", "gradle_technology", "language", "build_system",
             "framework", "dependency", "risk", "entry points", "configuración", "documentación",
         }

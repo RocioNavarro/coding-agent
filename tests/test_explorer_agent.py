@@ -245,7 +245,7 @@ def test_incremental_scan_reloads_real_gradle_and_functional_evidence(
     ''')
     write(root / "build.gradle.kts", '''
         tasks.register("installGitHooks") {
-            file("gradle/scripts/pre-commit").writeText("./gradlew spotlessApply\\n./gradlew test")
+            file("gradle/scripts/pre-commit").writeText("./gradlew -q spotlessApply\\n./gradlew --no-daemon test")
             Files.copy(source, file(".git/hooks/pre-commit"))
         }
     ''')
@@ -274,6 +274,8 @@ def test_incremental_scan_reloads_real_gradle_and_functional_evidence(
             "formatter": "implementation 'com.google.code.gson:gson:2.11.0'",
             "linter": "implementation 'com.google.code.gson:gson:2.11.0'",
         }.get(module, "")
+        if module == "parser":
+            external += "\ntestImplementation project(':lexer')"
         test_block = 'test { minHeapSize = "64m"\nmaxHeapSize = "128m"\n}' if module in {"runner", "interpreter"} else ""
         write(root / module / "build.gradle", f"version = '{versions.get(module, '1.0-SNAPSHOT')}'\n{deps}\n{external}\ntestImplementation 'org.jetbrains.kotlin:kotlin-test'\n{test_block}")
     functional = {
@@ -284,7 +286,12 @@ def test_incremental_scan_reloads_real_gradle_and_functional_evidence(
         "interpreter/src/main/kotlin/org/printscript/interpreter/Interpreter.kt": "class Interpreter",
         "formatter/src/main/kotlin/org/printscript/formatter/CodeFormatter.kt": "class CodeFormatter",
         "linter/src/main/kotlin/org/printscript/linter/Linter.kt": "class Linter",
-        "runner/src/main/kotlin/org/printscript/runner/Runner.kt": "InputStream Lexer Parser Interpreter",
+        "runner/src/main/kotlin/org/printscript/runner/Runner.kt": (
+            "fun run(input: InputStream) { val reader = InputStreamReader(input); "
+            "val lexer = Lexer(provider); val tokens = lexer.lex(reader); "
+            "val parser: Parser = parser; val ast = parser.parse(tokens); "
+            "val interpreter: Interpreter = interpreter; interpreter.executeNode(ast.first()) }"
+        ),
         "cli/src/main/kotlin/org/printscript/cli/Main.kt": "fun main()",
         "cli/src/main/kotlin/org/printscript/cli/commands/ExecuteCmd.kt": "FrontendAdapter InterpreterAdapter",
         "cli/src/main/kotlin/org/printscript/cli/commands/AnalyzeCmd.kt": "class AnalyzeCmd",
@@ -293,8 +300,8 @@ def test_incremental_scan_reloads_real_gradle_and_functional_evidence(
     }
     for path, content in functional.items():
         write(root / path, content)
-    write(root / "README.md", "./gradlew build\n./gradlew test\n./gradlew check")
-    write(root / ".github/workflows/ci.yml", "./gradlew spotlessCheck\n./gradlew jacocoTestReport\n./gradlew publish")
+    write(root / "README.md", "./gradlew -p . build\n./gradlew --no-daemon test\n./gradlew -q check")
+    write(root / ".github/workflows/ci.yml", "./gradlew spotlessCheck\n./gradlew --stacktrace jacocoTestReport\n./gradlew publish")
 
     first_memory = ProjectMemory(root, storage_root=storage)
     ExplorerAgent(repository_root=root, llm_client=FakeExplorerLLM(), project_memory=first_memory).run(
@@ -307,6 +314,10 @@ def test_incremental_scan_reloads_real_gradle_and_functional_evidence(
     ).run("Analizar arquitectura", state)
 
     assert dependencies.items() <= report_result_dependencies(state).items()
+    assert any(
+        finding.startswith("test_internal_dependency=parser -> lexer")
+        for finding in state.repository_findings
+    )
     assert any("Kotlin Gradle Plugin 2.1.10" in item for item in state.repository_findings)
     assert any("Java toolchain 21" in item for item in state.repository_findings)
     assert any("Spotless 6.25.0" in item for item in state.repository_findings)
@@ -343,7 +354,7 @@ def test_incremental_scan_reloads_real_gradle_and_functional_evidence(
         assert f"./gradlew {command}" in summary
     assert summary.count("Inferencia:") >= 6
     assert "Módulos declarados más de una vez: runner" in summary
-    assert "Camino alternativo: `runner` conecta Lexer → Parser → Interpreter" in summary
+    assert "Camino alternativo: `runner` conecta InputStream → Lexer → Parser → Interpreter" in summary
     assert "Evidencia: `runner/src/main/kotlin/org/printscript/runner/Runner.kt`" in summary
 
 
