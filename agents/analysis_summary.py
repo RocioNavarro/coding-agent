@@ -76,7 +76,7 @@ class DeterministicAnalysisSummary:
         sections = [
             "# Informe técnico del repositorio",
             "## 1. Objetivo general\n"
-            + self._objective(modules, paths, research_summary, explorer),
+            + self._objective(modules, paths, research_summary, explorer, researcher),
             "## 2. Arquitectura general\n" + self._architecture(modules, research_summary),
             "## 3. Módulos y responsabilidades\n" + ("\n".join(responsibilities) or "No confirmados."),
             "## 4. Dependencias internas\n" + self._bullets(
@@ -121,7 +121,9 @@ class DeterministicAnalysisSummary:
     def _research_summary(self, result: SubagentResult | None) -> str:
         if result is None:
             return ""
-        text = result.summary or result.result or ""
+        text = result.summary or result.result or "\n".join(
+            (*result.findings, *result.recommendations)
+        )
         lines = []
         for line in text.splitlines():
             clean = line.strip()
@@ -167,16 +169,17 @@ class DeterministicAnalysisSummary:
     def _entry_points(
         cls, findings: Sequence[str], paths: Sequence[str] = ()
     ) -> tuple[str, ...]:
+        structured: list[str] = []
         for finding in findings:
             if finding.casefold().startswith("entry points:"):
                 payload = finding.split(":", 1)[1].split(";", 1)[0]
-                return cls._unique(item.strip() for item in payload.split(","))
-        return cls._unique(
+                structured.extend(item.strip() for item in payload.split(","))
+        confirmed = (
             path for path in paths
             if path.endswith("/Main.kt")
-            or path.endswith("/commands/ExecuteCmd.kt")
-            or path.endswith("/commands/AnalyzeCmd.kt")
+            or ("/commands/" in path and path.endswith("Cmd.kt"))
         )
+        return cls._unique((*structured, *confirmed))
 
     def _objective(
         self,
@@ -184,6 +187,7 @@ class DeterministicAnalysisSummary:
         paths: Sequence[str],
         research: str,
         explorer: SubagentResult | None,
+        researcher: SubagentResult | None,
     ) -> str:
         """Formula el propósito desde capacidades confirmadas y cita evidencia breve."""
         capabilities = [
@@ -219,7 +223,7 @@ class DeterministicAnalysisSummary:
         )
         if supporting:
             purpose += "\n\n" + self._clip(supporting, self.MAX_ITEM_CHARS)
-        elif explorer is not None:
+        elif not self._has_research_content(researcher) and explorer is not None:
             purpose += "\n\nNo se recibió una síntesis técnica de Researcher; el objetivo se derivó de Explorer."
         preferred = (
             "docs/printscript-language-spec.md", "settings.gradle.kts",
@@ -238,6 +242,16 @@ class DeterministicAnalysisSummary:
         if len(values) < 2:
             return "".join(values)
         return ", ".join(values[:-1]) + " y " + values[-1]
+
+    @staticmethod
+    def _has_research_content(result: SubagentResult | None) -> bool:
+        return bool(result and any((
+            result.summary,
+            result.result,
+            result.findings,
+            result.recommendations,
+            result.sources,
+        )))
 
     @classmethod
     def _commands(cls, state: TaskState) -> tuple[str, ...]:

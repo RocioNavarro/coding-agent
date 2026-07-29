@@ -7,7 +7,9 @@ from agents.explorer import ExplorerAgent
 from core.task_state import SourceReference, SubagentResult, TaskState
 
 
-def printscript_state(*, with_researcher: bool = True) -> TaskState:
+def printscript_state(
+    *, with_researcher: bool = True, complete_entry_finding: bool = True
+) -> TaskState:
     state = TaskState.create("Analizar PrintScript", task_id="fake-printscript")
     state.add_repository_finding(
         "modules=common, token, lexer, parser, interpreter, formatter, linter, runner, cli; "
@@ -37,11 +39,17 @@ def printscript_state(*, with_researcher: bool = True) -> TaskState:
         "gradle_technology=Kotlin, Java toolchain, Gradle, Picocli, Gson, JUnit, "
         "Kotlin Test, Spotless, Foojay"
     )
+    entry_points = [
+        "cli/src/main/kotlin/org/printscript/cli/Main.kt",
+        "lexer/src/main/kotlin/org/printscript/lexer/Main.kt",
+    ]
+    if complete_entry_finding:
+        entry_points.extend((
+            "cli/src/main/kotlin/org/printscript/cli/commands/ExecuteCmd.kt",
+            "cli/src/main/kotlin/org/printscript/cli/commands/AnalyzeCmd.kt",
+        ))
     state.add_repository_finding(
-        "entry points: cli/src/main/kotlin/org/printscript/cli/Main.kt, "
-        "lexer/src/main/kotlin/org/printscript/lexer/Main.kt, "
-        "cli/src/main/kotlin/org/printscript/cli/commands/ExecuteCmd.kt, "
-        "cli/src/main/kotlin/org/printscript/cli/commands/AnalyzeCmd.kt; evidencia: inventario."
+        "entry points: " + ", ".join(entry_points) + "; evidencia: inventario."
     )
     paths = (
         "common/src/main/kotlin/org/printscript/common/Position.kt",
@@ -53,6 +61,7 @@ def printscript_state(*, with_researcher: bool = True) -> TaskState:
         "linter/src/main/kotlin/org/printscript/linter/Linter.kt",
         "runner/src/main/kotlin/org/printscript/runner/Runner.kt",
         "cli/src/main/kotlin/org/printscript/cli/commands/ExecuteCmd.kt",
+        "cli/src/main/kotlin/org/printscript/cli/commands/AnalyzeCmd.kt",
         "settings.gradle.kts", "build.gradle.kts", "docs/printscript-language-spec.md",
     )
     state.add_subagent_result(SubagentResult(
@@ -139,6 +148,29 @@ def test_confirmed_entry_points_are_listed_before_flows() -> None:
     assert "InputStream → Lexer → Parser → Interpreter" in section
 
 
+def test_entry_points_merge_findings_and_confirmed_paths_in_stable_order() -> None:
+    state = printscript_state(complete_entry_finding=False)
+    # Repetir una ruta entre findings y fuentes prueba la deduplicación por ruta.
+    state.add_source(SourceReference(
+        "repository", "cli/src/main/kotlin/org/printscript/cli/Main.kt"
+    ))
+
+    report = DeterministicAnalysisSummary().build(state)
+    section = report.split("## 6. Puntos de entrada y flujo de ejecución\n", 1)[1].split(
+        "\n\n## 7.", 1
+    )[0]
+    expected = (
+        "cli/src/main/kotlin/org/printscript/cli/Main.kt",
+        "lexer/src/main/kotlin/org/printscript/lexer/Main.kt",
+        "cli/src/main/kotlin/org/printscript/cli/commands/ExecuteCmd.kt",
+        "cli/src/main/kotlin/org/printscript/cli/commands/AnalyzeCmd.kt",
+    )
+    positions = [section.index(f"`{path}`") for path in expected]
+    assert positions == sorted(positions)
+    assert all(section.count(f"`{path}`") == 1 for path in expected)
+    assert "No confirmado" not in section
+
+
 def test_missing_entry_points_are_reported_as_unconfirmed() -> None:
     state = TaskState.create("Analizar repositorio", task_id="without-entry-points")
     state.add_repository_finding("modules=lexer, parser, interpreter")
@@ -162,6 +194,43 @@ def test_report_remains_structured_without_researcher_summary() -> None:
     assert "No se recibió una síntesis técnica de Researcher" in report
     assert "## 3. Módulos y responsabilidades" in report
     assert "## 14. Fuentes principales" in report
+
+
+@pytest.mark.parametrize(
+    "researcher",
+    (
+        SubagentResult("researcher", "analizar", "completed", summary="Resumen útil."),
+        SubagentResult("researcher", "analizar", "completed", result="Resultado útil."),
+        SubagentResult(
+            "researcher", "analizar", "completed",
+            findings=("HECHO CONFIRMADO: evidencia útil.",),
+        ),
+        SubagentResult(
+            "researcher", "analizar", "completed",
+            sources=(SourceReference("rag", "rag://evidencia"),),
+        ),
+    ),
+)
+def test_researcher_content_prevents_false_missing_summary_warning(
+    researcher: SubagentResult,
+) -> None:
+    state = printscript_state(with_researcher=False)
+    state.add_subagent_result(researcher)
+
+    report = DeterministicAnalysisSummary().build(state)
+
+    assert "No se recibió una síntesis técnica de Researcher" not in report
+    assert researcher.summary is None or researcher.summary in report
+    assert researcher.result is None or researcher.result in report
+
+
+def test_empty_researcher_result_keeps_missing_summary_warning() -> None:
+    state = printscript_state(with_researcher=False)
+    state.add_subagent_result(SubagentResult("researcher", "analizar", "completed"))
+
+    report = DeterministicAnalysisSummary().build(state)
+
+    assert "No se recibió una síntesis técnica de Researcher" in report
 
 
 def test_raw_inventory_is_bounded_and_not_dumped() -> None:
